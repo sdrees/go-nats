@@ -1,16 +1,29 @@
-// Copyright 2015 Apcera Inc. All rights reserved.
+// Copyright 2015-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package test
 
 import (
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 
-	gnatsd "github.com/nats-io/gnatsd/test"
+	natsserver "github.com/nats-io/nats-server/v2/test"
 )
 
 // So that we can pass tests and benchmarks...
@@ -37,6 +50,23 @@ func WaitTime(ch chan bool, timeout time.Duration) error {
 	return errors.New("timeout")
 }
 
+func stackFatalf(t tLogger, f string, args ...interface{}) {
+	lines := make([]string, 0, 32)
+	msg := fmt.Sprintf(f, args...)
+	lines = append(lines, msg)
+
+	// Generate the Stack of callers: Skip us and verify* frames.
+	for i := 1; true; i++ {
+		_, file, line, ok := runtime.Caller(i)
+		if !ok {
+			break
+		}
+		msg := fmt.Sprintf("%d - %s:%d", i, file, line)
+		lines = append(lines, msg)
+	}
+	t.Fatalf("%s", strings.Join(lines, "\n"))
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Creating client connections
 ////////////////////////////////////////////////////////////////////////////////
@@ -48,7 +78,7 @@ func NewDefaultConnection(t tLogger) *nats.Conn {
 
 // NewConnection forms connection on a given port.
 func NewConnection(t tLogger, port int) *nats.Conn {
-	url := fmt.Sprintf("nats://localhost:%d", port)
+	url := fmt.Sprintf("nats://127.0.0.1:%d", port)
 	nc, err := nats.Connect(url)
 	if err != nil {
 		t.Fatalf("Failed to create default connection: %v\n", err)
@@ -67,7 +97,7 @@ func NewEConn(t tLogger) *nats.EncodedConn {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Running gnatsd server in separate Go routines
+// Running nats server in separate Go routines
 ////////////////////////////////////////////////////////////////////////////////
 
 // RunDefaultServer will run a server on the default port.
@@ -77,17 +107,17 @@ func RunDefaultServer() *server.Server {
 
 // RunServerOnPort will run a server on the given port.
 func RunServerOnPort(port int) *server.Server {
-	opts := gnatsd.DefaultTestOptions
+	opts := natsserver.DefaultTestOptions
 	opts.Port = port
 	return RunServerWithOptions(opts)
 }
 
 // RunServerWithOptions will run a server with the given options.
 func RunServerWithOptions(opts server.Options) *server.Server {
-	return gnatsd.RunServer(&opts)
+	return natsserver.RunServer(&opts)
 }
 
 // RunServerWithConfig will run a server with the given configuration file.
 func RunServerWithConfig(configFile string) (*server.Server, *server.Options) {
-	return gnatsd.RunServerWithConfig(configFile)
+	return natsserver.RunServerWithConfig(configFile)
 }

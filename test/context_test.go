@@ -1,4 +1,15 @@
-// Copyright 2012-2017 Apcera Inc. All rights reserved.
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 // +build go1.7
 
@@ -7,10 +18,11 @@ package test
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats.go"
 )
 
 func TestContextRequestWithNilConnection(t *testing.T) {
@@ -21,7 +33,7 @@ func TestContextRequestWithNilConnection(t *testing.T) {
 
 	_, err := nc.RequestWithContext(ctx, "fast", []byte(""))
 	if err == nil {
-		t.Fatalf("Expected request with context and nil connection to fail\n")
+		t.Fatal("Expected request with context and nil connection to fail")
 	}
 	if err != nats.ErrInvalidConnection {
 		t.Fatalf("Expected nats.ErrInvalidConnection, got %v\n", err)
@@ -55,7 +67,7 @@ func testContextRequestWithTimeout(t *testing.T, nc *nats.Conn) {
 	// Slow request hits timeout so expected to fail.
 	_, err = nc.RequestWithContext(ctx, "slow", []byte("world"))
 	if err == nil {
-		t.Fatalf("Expected request with timeout context to fail: %s", err)
+		t.Fatal("Expected request with timeout context to fail")
 	}
 
 	// Reported error is "context deadline exceeded" from Context package,
@@ -65,7 +77,7 @@ func testContextRequestWithTimeout(t *testing.T, nc *nats.Conn) {
 	}
 	timeoutErr, ok := err.(timeoutError)
 	if !ok || !timeoutErr.Timeout() {
-		t.Errorf("Expected to have a timeout error")
+		t.Error("Expected to have a timeout error")
 	}
 	expected = `context deadline exceeded`
 	if !strings.Contains(err.Error(), expected) {
@@ -76,7 +88,7 @@ func testContextRequestWithTimeout(t *testing.T, nc *nats.Conn) {
 	// has already timed out.
 	_, err = nc.RequestWithContext(ctx, "fast", []byte("world"))
 	if err == nil {
-		t.Fatalf("Expected request with context to fail: %s", err)
+		t.Fatal("Expected request with context to fail")
 	}
 }
 
@@ -125,9 +137,10 @@ func testContextRequestWithTimeoutCanceled(t *testing.T, nc *nats.Conn) {
 	// Cancel the context already so that rest of requests fail.
 	cancelCB()
 
+	// Context is already canceled so requests should immediately fail.
 	_, err = nc.RequestWithContext(ctx, "fast", []byte("world"))
 	if err == nil {
-		t.Fatalf("Expected request with timeout context to fail: %s", err)
+		t.Fatal("Expected request with timeout context to fail")
 	}
 
 	// Reported error is "context canceled" from Context package,
@@ -146,7 +159,7 @@ func testContextRequestWithTimeoutCanceled(t *testing.T, nc *nats.Conn) {
 	// 2nd request should fail again even if fast because context has already been canceled
 	_, err = nc.RequestWithContext(ctx, "fast", []byte("world"))
 	if err == nil {
-		t.Fatalf("Expected request with context to fail: %s", err)
+		t.Fatal("Expected request with context to fail")
 	}
 }
 
@@ -227,7 +240,7 @@ func testContextRequestWithCancel(t *testing.T, nc *nats.Conn) {
 	// One more slow request will expire the timer and cause an error...
 	_, err := nc.RequestWithContext(ctx, "slow", []byte(""))
 	if err == nil {
-		t.Fatalf("Expected request with cancellation context to fail: %s", err)
+		t.Fatal("Expected request with cancellation context to fail")
 	}
 
 	// ...though reported error is "context canceled" from Context package,
@@ -294,7 +307,7 @@ func testContextRequestWithDeadline(t *testing.T, nc *nats.Conn) {
 	// reach the deadline.
 	_, err := nc.RequestWithContext(ctx, "slow", []byte(""))
 	if err == nil {
-		t.Fatalf("Expected request with context to reach deadline: %s", err)
+		t.Fatal("Expected request with context to reach deadline")
 	}
 
 	// Reported error is "context deadline exceeded" from Context package,
@@ -372,7 +385,7 @@ func TestContextSubNextMsgWithTimeout(t *testing.T) {
 	// Third message will fail because the context will be canceled by now
 	_, err = sub.NextMsgWithContext(ctx)
 	if err == nil {
-		t.Fatalf("Expected to fail receiving a message: %s", err)
+		t.Fatal("Expected to fail receiving a message")
 	}
 
 	// Reported error is "context deadline exceeded" from Context package,
@@ -429,7 +442,7 @@ func TestContextSubNextMsgWithTimeoutCanceled(t *testing.T) {
 
 	_, err = sub.NextMsgWithContext(ctx)
 	if err == nil {
-		t.Fatalf("Expected request with timeout context to fail: %s", err)
+		t.Fatal("Expected request with timeout context to fail")
 	}
 
 	// Reported error is "context canceled" from Context package,
@@ -504,7 +517,7 @@ func TestContextSubNextMsgWithCancel(t *testing.T) {
 	// cancel the context.
 	_, err = sub2.NextMsgWithContext(ctx)
 	if err == nil {
-		t.Fatalf("Expected request with context to fail: %s", err)
+		t.Fatal("Expected request with context to fail")
 	}
 
 	// Reported error is "context canceled" from Context package,
@@ -559,7 +572,7 @@ func TestContextSubNextMsgWithDeadline(t *testing.T) {
 	// Third message will fail because the context will be canceled by now
 	_, err = sub.NextMsgWithContext(ctx)
 	if err == nil {
-		t.Fatalf("Expected to fail receiving a message: %s", err)
+		t.Fatal("Expected to fail receiving a message")
 	}
 
 	// Reported error is "context deadline exceeded" from Context package,
@@ -630,7 +643,7 @@ func TestContextEncodedRequestWithTimeout(t *testing.T) {
 	resp := &response{}
 	err = c.RequestWithContext(ctx, "slow", req, resp)
 	if err == nil {
-		t.Fatalf("Expected request with context to reach deadline: %s", err)
+		t.Fatal("Expected request with context to reach deadline")
 	}
 
 	// Reported error is "context deadline exceeded" from Context package,
@@ -696,7 +709,7 @@ func TestContextEncodedRequestWithTimeoutCanceled(t *testing.T) {
 
 	err = c.RequestWithContext(ctx, "fast", req, resp)
 	if err == nil {
-		t.Fatalf("Expected request with timeout context to fail: %s", err)
+		t.Fatal("Expected request with timeout context to fail")
 	}
 
 	// Reported error is "context canceled" from Context package,
@@ -715,7 +728,7 @@ func TestContextEncodedRequestWithTimeoutCanceled(t *testing.T) {
 	// 2nd request should fail again even if fast because context has already been canceled
 	err = c.RequestWithContext(ctx, "fast", req, resp)
 	if err == nil {
-		t.Fatalf("Expected request with timeout context to fail: %s", err)
+		t.Fatal("Expected request with timeout context to fail")
 	}
 }
 
@@ -807,7 +820,7 @@ func TestContextEncodedRequestWithCancel(t *testing.T) {
 	// One more slow request will expire the timer and cause an error...
 	err = c.RequestWithContext(ctx, "slow", req, resp)
 	if err == nil {
-		t.Fatalf("Expected request with cancellation context to fail: %s", err)
+		t.Fatal("Expected request with cancellation context to fail")
 	}
 
 	// ...though reported error is "context canceled" from Context package,
@@ -877,7 +890,7 @@ func TestContextEncodedRequestWithDeadline(t *testing.T) {
 	resp := &response{}
 	err = c.RequestWithContext(ctx, "slow", req, resp)
 	if err == nil {
-		t.Fatalf("Expected request with context to reach deadline: %s", err)
+		t.Fatal("Expected request with context to reach deadline")
 	}
 
 	// Reported error is "context deadline exceeded" from Context package,
@@ -910,7 +923,7 @@ func TestContextRequestConnClosed(t *testing.T) {
 	nc.Close()
 	_, err := nc.RequestWithContext(ctx, "foo", []byte(""))
 	if err == nil {
-		t.Fatalf("Expected request to fail with error")
+		t.Fatal("Expected request to fail with error")
 	}
 	if err != nats.ErrConnectionClosed {
 		t.Errorf("Expected request to fail with connection closed error: %s", err)
@@ -941,7 +954,7 @@ func TestContextBadSubscription(t *testing.T) {
 
 	_, err = sub.NextMsgWithContext(ctx)
 	if err == nil {
-		t.Fatalf("Expected to fail getting next message with context")
+		t.Fatal("Expected to fail getting next message with context")
 	}
 
 	if err != nats.ErrBadSubscription {
@@ -960,9 +973,10 @@ func TestContextInvalid(t *testing.T) {
 	}
 	defer c.Close()
 
+	//lint:ignore SA1012 testing that passing nil fails
 	_, err = nc.RequestWithContext(nil, "foo", []byte(""))
 	if err == nil {
-		t.Fatalf("Expected request to fail with error")
+		t.Fatal("Expected request to fail with error")
 	}
 	if err != nats.ErrInvalidContext {
 		t.Errorf("Expected request to fail with connection closed error: %s", err)
@@ -973,9 +987,10 @@ func TestContextInvalid(t *testing.T) {
 		t.Fatalf("Expected to be able to subscribe: %s", err)
 	}
 
+	//lint:ignore SA1012 testing that passing nil fails
 	_, err = sub.NextMsgWithContext(nil)
 	if err == nil {
-		t.Fatalf("Expected request to fail with error")
+		t.Fatal("Expected request to fail with error")
 	}
 	if err != nats.ErrInvalidContext {
 		t.Errorf("Expected request to fail with connection closed error: %s", err)
@@ -989,11 +1004,83 @@ func TestContextInvalid(t *testing.T) {
 	}
 	req := &request{Message: "Hello"}
 	resp := &response{}
+	//lint:ignore SA1012 testing that passing nil fails
 	err = c.RequestWithContext(nil, "slow", req, resp)
 	if err == nil {
-		t.Fatalf("Expected request with context to reach deadline: %s", err)
+		t.Fatal("Expected request to fail with error")
 	}
 	if err != nats.ErrInvalidContext {
-		t.Errorf("Expected request to fail with connection closed error: %s", err)
+		t.Errorf("Expected request to fail with invalid context: %s", err)
 	}
+}
+
+func TestFlushWithContext(t *testing.T) {
+	s := RunDefaultServer()
+	defer s.Shutdown()
+
+	nc := NewDefaultConnection(t)
+	defer nc.Close()
+
+	ctx := context.Background()
+
+	// No context should error.
+	//lint:ignore SA1012 testing that passing nil fails
+	if err := nc.FlushWithContext(nil); err != nats.ErrInvalidContext {
+		t.Fatalf("Expected '%v', got '%v'", nats.ErrInvalidContext, err)
+	}
+	// A context with no deadline set should error also.
+	if err := nc.FlushWithContext(ctx); err != nats.ErrNoDeadlineContext {
+		t.Fatalf("Expected '%v', got '%v'", nats.ErrNoDeadlineContext, err)
+	}
+
+	dctx, cancel := context.WithTimeout(ctx, 0)
+	defer cancel()
+
+	// A context with a deadline should return when expired.
+	if err := nc.FlushWithContext(dctx); err != context.DeadlineExceeded {
+		t.Fatalf("Expected '%v', got '%v'", context.DeadlineExceeded, err)
+	}
+}
+
+func TestUnsubscribeAndNextMsgWithContext(t *testing.T) {
+	s := RunDefaultServer()
+	defer s.Shutdown()
+
+	nc := NewDefaultConnection(t)
+	defer nc.Close()
+
+	ctx, cancelCB := context.WithCancel(context.Background())
+	defer cancelCB() // should always be called, not discarded, to prevent context leak
+
+	sub, err := nc.SubscribeSync("foo")
+	if err != nil {
+		t.Fatalf("Expected to be able to subscribe: %s", err)
+	}
+	sub.Unsubscribe()
+	if _, err = sub.NextMsgWithContext(ctx); err != nats.ErrBadSubscription {
+		t.Fatalf("Expected '%v', but got: '%v'", nats.ErrBadSubscription, err)
+	}
+
+	ctx, cancelCB = context.WithCancel(context.Background())
+	defer cancelCB() // should always be called, not discarded, to prevent context leak
+
+	sub, err = nc.SubscribeSync("foo")
+	if err != nil {
+		t.Fatalf("Expected to be able to subscribe: %s", err)
+	}
+
+	// Now make sure we get same error when unsubscribing from separate routine
+	// while in the call.
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		sub.Unsubscribe()
+		wg.Done()
+	}()
+
+	if _, err = sub.NextMsgWithContext(ctx); err != nats.ErrBadSubscription {
+		t.Fatalf("Expected '%v', but got: '%v'", nats.ErrBadSubscription, err)
+	}
+	wg.Wait()
 }

@@ -1,7 +1,21 @@
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package test
 
 import (
 	"bytes"
+	"fmt"
 	"math"
 	"regexp"
 	"runtime"
@@ -10,18 +24,37 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats.go"
 )
+
+// This function returns the number of go routines ensuring
+// that runtime.NumGoroutine() returns the same value
+// several times in a row with little delay between captures.
+// This will check for at most 500ms for value to be stable.
+func getStableNumGoroutine(t *testing.T) int {
+	t.Helper()
+	timeout := time.Now().Add(500 * time.Millisecond)
+	var base, old, same int
+	for time.Now().Before(timeout) {
+		base = runtime.NumGoroutine()
+		if old == base {
+			same++
+			if same == 8 {
+				return base
+			}
+		}
+		old = base
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("Unable to get stable number of go routines")
+	return 0
+}
 
 func TestCloseLeakingGoRoutines(t *testing.T) {
 	s := RunDefaultServer()
 	defer s.Shutdown()
 
-	// Give time for things to settle before capturing the number of
-	// go routines
-	time.Sleep(500 * time.Millisecond)
-
-	base := runtime.NumGoroutine()
+	base := getStableNumGoroutine(t)
 
 	nc := NewDefaultConnection(t)
 
@@ -30,22 +63,21 @@ func TestCloseLeakingGoRoutines(t *testing.T) {
 
 	// Give time for things to settle before capturing the number of
 	// go routines
-	time.Sleep(500 * time.Millisecond)
+	waitFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		delta := (runtime.NumGoroutine() - base)
+		if delta > 0 {
+			return fmt.Errorf("%d Go routines still exist post Close()", delta)
+		}
+		return nil
+	})
 
-	delta := (runtime.NumGoroutine() - base)
-	if delta > 0 {
-		t.Fatalf("%d Go routines still exist post Close()", delta)
-	}
 	// Make sure we can call Close() multiple times
 	nc.Close()
 }
 
 func TestLeakingGoRoutinesOnFailedConnect(t *testing.T) {
-	// Give time for things to settle before capturing the number of
-	// go routines
-	time.Sleep(500 * time.Millisecond)
 
-	base := runtime.NumGoroutine()
+	base := getStableNumGoroutine(t)
 
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err == nil {
@@ -55,12 +87,13 @@ func TestLeakingGoRoutinesOnFailedConnect(t *testing.T) {
 
 	// Give time for things to settle before capturing the number of
 	// go routines
-	time.Sleep(500 * time.Millisecond)
-
-	delta := (runtime.NumGoroutine() - base)
-	if delta > 0 {
-		t.Fatalf("%d Go routines still exist post Close()", delta)
-	}
+	waitFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		delta := (runtime.NumGoroutine() - base)
+		if delta > 0 {
+			return fmt.Errorf("%d Go routines still exist post Close()", delta)
+		}
+		return nil
+	})
 }
 
 func TestConnectedServer(t *testing.T) {
@@ -111,7 +144,7 @@ func TestBadOptionTimeoutConnect(t *testing.T) {
 
 	opts := nats.GetDefaultOptions()
 	opts.Timeout = -1
-	opts.Url = "nats://localhost:4222"
+	opts.Url = "nats://127.0.0.1:4222"
 
 	_, err := opts.Connect()
 	if err == nil {
@@ -216,13 +249,9 @@ func TestAsyncSubscribeRoutineLeakOnUnsubscribe(t *testing.T) {
 
 	ch := make(chan bool)
 
-	// Give time for things to settle before capturing the number of
-	// go routines
-	time.Sleep(500 * time.Millisecond)
-
 	// Take the base once the connection is established, but before
 	// the subscriber is created.
-	base := runtime.NumGoroutine()
+	base := getStableNumGoroutine(t)
 
 	sub, err := nc.Subscribe("foo", func(m *nats.Msg) { ch <- true })
 	if err != nil {
@@ -245,12 +274,13 @@ func TestAsyncSubscribeRoutineLeakOnUnsubscribe(t *testing.T) {
 
 	// Give time for things to settle before capturing the number of
 	// go routines
-	time.Sleep(500 * time.Millisecond)
-
-	delta := (runtime.NumGoroutine() - base)
-	if delta > 0 {
-		t.Fatalf("%d Go routines still exist post Unsubscribe()", delta)
-	}
+	waitFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		delta := (runtime.NumGoroutine() - base)
+		if delta > 0 {
+			return fmt.Errorf("%d Go routines still exist post Unsubscribe()", delta)
+		}
+		return nil
+	})
 }
 
 func TestAsyncSubscribeRoutineLeakOnClose(t *testing.T) {
@@ -259,13 +289,9 @@ func TestAsyncSubscribeRoutineLeakOnClose(t *testing.T) {
 
 	ch := make(chan bool)
 
-	// Give time for things to settle before capturing the number of
-	// go routines
-	time.Sleep(500 * time.Millisecond)
-
 	// Take the base before creating the connection, since we are going
 	// to close it before taking the delta.
-	base := runtime.NumGoroutine()
+	base := getStableNumGoroutine(t)
 
 	nc := NewDefaultConnection(t)
 	defer nc.Close()
@@ -291,12 +317,13 @@ func TestAsyncSubscribeRoutineLeakOnClose(t *testing.T) {
 
 	// Give time for things to settle before capturing the number of
 	// go routines
-	time.Sleep(500 * time.Millisecond)
-
-	delta := (runtime.NumGoroutine() - base)
-	if delta > 0 {
-		t.Fatalf("%d Go routines still exist post Close()", delta)
-	}
+	waitFor(t, 2*time.Second, 100*time.Millisecond, func() error {
+		delta := (runtime.NumGoroutine() - base)
+		if delta > 0 {
+			return fmt.Errorf("%d Go routines still exist post Close()", delta)
+		}
+		return nil
+	})
 }
 
 func TestSyncSubscribe(t *testing.T) {
@@ -332,6 +359,40 @@ func TestPubSubWithReply(t *testing.T) {
 	msg, err := sub.NextMsg(10 * time.Second)
 	if err != nil || !bytes.Equal(msg.Data, omsg) {
 		t.Fatal("Message received does not match")
+	}
+}
+
+func TestMsgRespond(t *testing.T) {
+	s := RunDefaultServer()
+	defer s.Shutdown()
+	nc := NewDefaultConnection(t)
+	defer nc.Close()
+
+	m := &nats.Msg{}
+	if err := m.Respond(nil); err != nats.ErrMsgNotBound {
+		t.Fatal("Expected ErrMsgNotBound error")
+	}
+
+	sub, err := nc.Subscribe("req", func(msg *nats.Msg) {
+		msg.Respond([]byte("42"))
+	})
+	if err != nil {
+		t.Fatal("Failed to subscribe: ", err)
+	}
+
+	// Fake the bound notion by assigning Sub directly to test no reply.
+	m.Sub = sub
+	if err := m.Respond(nil); err != nats.ErrMsgNoReply {
+		t.Fatal("Expected ErrMsgNoReply error")
+	}
+
+	response, err := nc.Request("req", []byte("help"), 50*time.Millisecond)
+	if err != nil {
+		t.Fatal("Request Failed: ", err)
+	}
+
+	if string(response.Data) != "42" {
+		t.Fatalf("Expected '42', got %q", response.Data)
 	}
 }
 
@@ -578,6 +639,7 @@ func TestSimultaneousRequests(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(1)
+		//lint:ignore SA2002 t.Fatalf in go routine will happen only if test fails
 		go func() {
 			if _, err := nc.Request("foo", nil, 2*time.Second); err != nil {
 				t.Fatalf("Expected to receive a timeout error")
@@ -744,7 +806,11 @@ func TestOptions(t *testing.T) {
 	s := RunDefaultServer()
 	defer s.Shutdown()
 
-	nc, err := nats.Connect(nats.DefaultURL, nats.Name("myName"), nats.MaxReconnects(2), nats.ReconnectWait(50*time.Millisecond))
+	nc, err := nats.Connect(nats.DefaultURL,
+		nats.Name("myName"),
+		nats.MaxReconnects(2),
+		nats.ReconnectWait(50*time.Millisecond),
+		nats.PingInterval(20*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Failed to connect: %v", err)
 	}

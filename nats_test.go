@@ -1,3 +1,16 @@
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package nats
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -10,15 +23,32 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"net"
+	"net/url"
+	"os"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
-	gnatsd "github.com/nats-io/gnatsd/test"
+	"github.com/nats-io/jwt"
+	"github.com/nats-io/nats-server/v2/server"
+	natsserver "github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nkeys"
 )
+
+func TestVersion(t *testing.T) {
+	// Semantic versioning
+	verRe := regexp.MustCompile(`\d+.\d+.\d+(-\S+)?`)
+	if !verRe.MatchString(Version) {
+		t.Fatalf("Version not compatible with semantic versioning: %q", Version)
+	}
+}
 
 // Dumb wait program to sync on callbacks, etc... Will timeout
 func Wait(ch chan bool) error {
@@ -40,7 +70,7 @@ func stackFatalf(t *testing.T, f string, args ...interface{}) {
 	lines = append(lines, msg)
 
 	// Generate the Stack of callers: Skip us and verify* frames.
-	for i := 2; true; i++ {
+	for i := 1; true; i++ {
 		_, file, line, ok := runtime.Caller(i)
 		if !ok {
 			break
@@ -51,6 +81,23 @@ func stackFatalf(t *testing.T, f string, args ...interface{}) {
 	t.Fatalf("%s", strings.Join(lines, "\n"))
 }
 
+func TestVersionMatchesTag(t *testing.T) {
+	tag := os.Getenv("TRAVIS_TAG")
+	if tag == "" {
+		t.SkipNow()
+	}
+	// We expect a tag of the form vX.Y.Z. If that's not the case,
+	// we need someone to have a look. So fail if first letter is not
+	// a `v`
+	if tag[0] != 'v' {
+		t.Fatalf("Expect tag to start with `v`, tag is: %s", tag)
+	}
+	// Strip the `v` from the tag for the version comparison.
+	if Version != tag[1:] {
+		t.Fatalf("Version (%s) does not match tag (%s)", Version, tag[1:])
+	}
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Reconnect tests
 ////////////////////////////////////////////////////////////////////////////////
@@ -58,7 +105,7 @@ func stackFatalf(t *testing.T, f string, args ...interface{}) {
 const TEST_PORT = 8368
 
 var reconnectOpts = Options{
-	Url:            fmt.Sprintf("nats://localhost:%d", TEST_PORT),
+	Url:            fmt.Sprintf("nats://127.0.0.1:%d", TEST_PORT),
 	AllowReconnect: true,
 	MaxReconnect:   10,
 	ReconnectWait:  100 * time.Millisecond,
@@ -66,13 +113,13 @@ var reconnectOpts = Options{
 }
 
 func RunServerOnPort(port int) *server.Server {
-	opts := gnatsd.DefaultTestOptions
+	opts := natsserver.DefaultTestOptions
 	opts.Port = port
-	return RunServerWithOptions(opts)
+	return RunServerWithOptions(&opts)
 }
 
-func RunServerWithOptions(opts server.Options) *server.Server {
-	return gnatsd.RunServer(&opts)
+func RunServerWithOptions(opts *server.Options) *server.Server {
+	return natsserver.RunServer(opts)
 }
 
 func TestReconnectServerStats(t *testing.T) {
@@ -109,6 +156,10 @@ func TestParseStateReconnectFunctionality(t *testing.T) {
 
 	opts := reconnectOpts
 	dch := make(chan bool)
+	dErrCh := make(chan bool)
+	opts.DisconnectedErrCB = func(_ *Conn, _ error) {
+		dErrCh <- true
+	}
 	opts.DisconnectedCB = func(_ *Conn) {
 		dch <- true
 	}
@@ -148,8 +199,14 @@ func TestParseStateReconnectFunctionality(t *testing.T) {
 	ts.Shutdown()
 	// server is stopped here...
 
-	if err := Wait(dch); err != nil {
-		t.Fatal("Did not get the DisconnectedCB")
+	if err := Wait(dErrCh); err != nil {
+		t.Fatal("Did not get the DisconnectedErrCB")
+	}
+
+	select {
+	case <-dch:
+		t.Fatal("Get the DEPRECATED DisconnectedCB while DisconnectedErrCB was set")
+	default:
 	}
 
 	if err := ec.Publish("foo", testString); err != nil {
@@ -188,6 +245,50 @@ var testServers = []string{
 	"nats://localhost:1226",
 	"nats://localhost:1227",
 	"nats://localhost:1228",
+}
+
+func TestSimplifiedURLs(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.NoRandomize = true
+	opts.Servers = []string{
+		"nats://host1:1234",
+		"nats://host2:",
+		"nats://host3",
+		"host4:1234",
+		"host5:",
+		"host6",
+		"nats://[1:2:3:4]:1234",
+		"nats://[5:6:7:8]:",
+		"nats://[9:10:11:12]",
+		"[13:14:15:16]:",
+		"[17:18:19:20]:1234",
+	}
+
+	// We expect the result in the server pool to be:
+	expected := []string{
+		"nats://host1:1234",
+		"nats://host2:4222",
+		"nats://host3:4222",
+		"nats://host4:1234",
+		"nats://host5:4222",
+		"nats://host6:4222",
+		"nats://[1:2:3:4]:1234",
+		"nats://[5:6:7:8]:4222",
+		"nats://[9:10:11:12]:4222",
+		"nats://[13:14:15:16]:4222",
+		"nats://[17:18:19:20]:1234",
+	}
+
+	nc := &Conn{Opts: opts}
+	if err := nc.setupServerPool(); err != nil {
+		t.Fatalf("Problem setting up Server Pool: %v\n", err)
+	}
+	// Check server pool directly
+	for i, u := range nc.srvPool {
+		if u.url.String() != expected[i] {
+			t.Fatalf("Expected url %q, got %q", expected[i], u.url.String())
+		}
+	}
 }
 
 func TestServersRandomize(t *testing.T) {
@@ -257,8 +358,8 @@ func TestSelectNextServer(t *testing.T) {
 	if err := nc.setupServerPool(); err != nil {
 		t.Fatalf("Problem setting up Server Pool: %v\n", err)
 	}
-	if nc.url != nc.srvPool[0].url {
-		t.Fatalf("Wrong default selection: %v\n", nc.url)
+	if nc.current != nc.srvPool[0] {
+		t.Fatalf("Wrong default selection: %v\n", nc.current.url)
 	}
 
 	sel, err := nc.selectNextServer()
@@ -269,8 +370,8 @@ func TestSelectNextServer(t *testing.T) {
 	if len(nc.srvPool) != len(testServers) {
 		t.Fatalf("List is incorrect size: %d vs %d\n", len(nc.srvPool), len(testServers))
 	}
-	if nc.url.String() != testServers[1] {
-		t.Fatalf("Selection incorrect: %v vs %v\n", nc.url, testServers[1])
+	if nc.current.url.String() != testServers[1] {
+		t.Fatalf("Selection incorrect: %v vs %v\n", nc.current.url, testServers[1])
 	}
 	if nc.srvPool[len(nc.srvPool)-1].url.String() != testServers[0] {
 		t.Fatalf("Did not push old to last position\n")
@@ -288,8 +389,8 @@ func TestSelectNextServer(t *testing.T) {
 	if len(nc.srvPool) != len(testServers)-1 {
 		t.Fatalf("List is incorrect size: %d vs %d\n", len(nc.srvPool), len(testServers)-1)
 	}
-	if nc.url.String() != testServers[2] {
-		t.Fatalf("Selection incorrect: %v vs %v\n", nc.url, testServers[2])
+	if nc.current.url.String() != testServers[2] {
+		t.Fatalf("Selection incorrect: %v vs %v\n", nc.current.url, testServers[2])
 	}
 	if nc.srvPool[len(nc.srvPool)-1].url.String() == testServers[1] {
 		t.Fatalf("Did not throw away the last server correctly\n")
@@ -580,7 +681,6 @@ func TestParserShouldFail(t *testing.T) {
 }
 
 func TestParserSplitMsg(t *testing.T) {
-
 	nc := &Conn{}
 	nc.ps = &parseState{}
 
@@ -794,39 +894,33 @@ func TestParserSplitMsg(t *testing.T) {
 }
 
 func TestNormalizeError(t *testing.T) {
-	received := "Typical Error"
-	expected := strings.ToLower(received)
-	if s := normalizeErr("-ERR '" + received + "'"); s != expected {
+	expected := "Typical Error"
+	if s := normalizeErr("-ERR '" + expected + "'"); s != expected {
 		t.Fatalf("Expected '%s', got '%s'", expected, s)
 	}
 
-	received = "Trim Surrounding Spaces"
-	expected = strings.ToLower(received)
-	if s := normalizeErr("-ERR    '" + received + "'   "); s != expected {
+	expected = "Trim Surrounding Spaces"
+	if s := normalizeErr("-ERR    '" + expected + "'   "); s != expected {
 		t.Fatalf("Expected '%s', got '%s'", expected, s)
 	}
 
-	received = "Trim Surrounding Spaces Without Quotes"
-	expected = strings.ToLower(received)
-	if s := normalizeErr("-ERR    " + received + "   "); s != expected {
+	expected = "Trim Surrounding Spaces Without Quotes"
+	if s := normalizeErr("-ERR    " + expected + "   "); s != expected {
 		t.Fatalf("Expected '%s', got '%s'", expected, s)
 	}
 
-	received = "Error Without Quotes"
-	expected = strings.ToLower(received)
-	if s := normalizeErr("-ERR " + received); s != expected {
+	expected = "Error Without Quotes"
+	if s := normalizeErr("-ERR " + expected); s != expected {
 		t.Fatalf("Expected '%s', got '%s'", expected, s)
 	}
 
-	received = "Error With Quote Only On Left"
-	expected = strings.ToLower(received)
-	if s := normalizeErr("-ERR '" + received); s != expected {
+	expected = "Error With Quote Only On Left"
+	if s := normalizeErr("-ERR '" + expected); s != expected {
 		t.Fatalf("Expected '%s', got '%s'", expected, s)
 	}
 
-	received = "Error With Quote Only On Right"
-	expected = strings.ToLower(received)
-	if s := normalizeErr("-ERR " + received + "'"); s != expected {
+	expected = "Error With Quote Only On Right"
+	if s := normalizeErr("-ERR " + expected + "'"); s != expected {
 		t.Fatalf("Expected '%s', got '%s'", expected, s)
 	}
 }
@@ -935,7 +1029,7 @@ func TestAsyncINFO(t *testing.T) {
 		}
 	}
 
-	checkPool := func(inThatOrder bool, urls ...string) {
+	checkPool := func(urls ...string) {
 		// Check both pool and urls map
 		if len(c.srvPool) != len(urls) {
 			stackFatalf(t, "Pool should have %d elements, has %d", len(urls), len(c.srvPool))
@@ -943,120 +1037,44 @@ func TestAsyncINFO(t *testing.T) {
 		if len(c.urls) != len(urls) {
 			stackFatalf(t, "Map should have %d elements, has %d", len(urls), len(c.urls))
 		}
-		for i, url := range urls {
-			if inThatOrder {
-				if c.srvPool[i].url.Host != url {
-					stackFatalf(t, "Pool should have %q at index %q, has %q", url, i, c.srvPool[i].url.Host)
-				}
-			} else {
-				if _, present := c.urls[url]; !present {
-					stackFatalf(t, "Pool should have %q", url)
-				}
+		for _, url := range urls {
+			if _, present := c.urls[url]; !present {
+				stackFatalf(t, "Pool should have %q", url)
 			}
 		}
 	}
 
 	// Now test the decoding of "connect_urls"
 
-	// No randomize for now
-	c.Opts.NoRandomize = true
 	// Reset the pool
 	c.setupServerPool()
 	// Reinitialize the parser
 	c.ps = &parseState{}
 
-	info = []byte("INFO {\"connect_urls\":[\"localhost:5222\"]}\r\n")
+	info = []byte("INFO {\"connect_urls\":[\"localhost:4222\", \"localhost:5222\"]}\r\n")
 	err = c.parse(info)
 	if err != nil || c.ps.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
 	}
-	// Pool now should contain localhost:4222 (the default URL) and localhost:5222
-	checkPool(true, "localhost:4222", "localhost:5222")
+	// Pool now should contain 127.0.0.1:4222 (the default URL), localhost:4222 and localhost:5222
+	checkPool("127.0.0.1:4222", "localhost:4222", "localhost:5222")
 
 	// Make sure that if client receives the same, it is not added again.
 	err = c.parse(info)
 	if err != nil || c.ps.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
 	}
-	// Pool should still contain localhost:4222 (the default URL) and localhost:5222
-	checkPool(true, "localhost:4222", "localhost:5222")
+	// Pool should still contain 127.0.0.1:4222 (the default URL), localhost:4222 and localhost:5222
+	checkPool("127.0.0.1:4222", "localhost:4222", "localhost:5222")
 
 	// Receive a new URL
-	info = []byte("INFO {\"connect_urls\":[\"localhost:6222\"]}\r\n")
+	info = []byte("INFO {\"connect_urls\":[\"localhost:4222\", \"localhost:5222\", \"localhost:6222\"]}\r\n")
 	err = c.parse(info)
 	if err != nil || c.ps.state != OP_START {
 		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
 	}
-	// Pool now should contain localhost:4222 (the default URL) localhost:5222 and localhost:6222
-	checkPool(true, "localhost:4222", "localhost:5222", "localhost:6222")
-
-	// Receive more than 1 URL at once
-	info = []byte("INFO {\"connect_urls\":[\"localhost:7222\", \"localhost:8222\"]}\r\n")
-	err = c.parse(info)
-	if err != nil || c.ps.state != OP_START {
-		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
-	}
-	// Pool now should contain localhost:4222 (the default URL) localhost:5222, localhost:6222
-	// localhost:7222 and localhost:8222
-	checkPool(true, "localhost:4222", "localhost:5222", "localhost:6222", "localhost:7222", "localhost:8222")
-
-	// Test with pool randomization now. Note that with randominzation,
-	// the initial pool is randomize, then each array of urls that the
-	// client gets from the INFO protocol is randomized, but added to
-	// the end of the pool.
-	c.Opts.NoRandomize = false
-	c.setupServerPool()
-
-	info = []byte("INFO {\"connect_urls\":[\"localhost:5222\"]}\r\n")
-	err = c.parse(info)
-	if err != nil || c.ps.state != OP_START {
-		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
-	}
-	// Pool now should contain localhost:4222 (the default URL) and localhost:5222
-	checkPool(true, "localhost:4222", "localhost:5222")
-
-	// Make sure that if client receives the same, it is not added again.
-	err = c.parse(info)
-	if err != nil || c.ps.state != OP_START {
-		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
-	}
-	// Pool should still contain localhost:4222 (the default URL) and localhost:5222
-	checkPool(true, "localhost:4222", "localhost:5222")
-
-	// Receive a new URL
-	info = []byte("INFO {\"connect_urls\":[\"localhost:6222\"]}\r\n")
-	err = c.parse(info)
-	if err != nil || c.ps.state != OP_START {
-		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
-	}
-	// Pool now should contain localhost:4222 (the default URL) localhost:5222 and localhost:6222
-	checkPool(true, "localhost:4222", "localhost:5222", "localhost:6222")
-
-	// Receive more than 1 URL at once. Add more than 2 to increase the chance of
-	// the array being shuffled.
-	info = []byte("INFO {\"connect_urls\":[\"localhost:7222\", \"localhost:8222\", " +
-		"\"localhost:9222\", \"localhost:10222\", \"localhost:11222\"]}\r\n")
-	err = c.parse(info)
-	if err != nil || c.ps.state != OP_START {
-		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
-	}
-	// Pool now should contain localhost:4222 (the default URL) localhost:5222, localhost:6222
-	// localhost:7222, localhost:8222, localhost:9222, localhost:10222 and localhost:11222
-	checkPool(false, "localhost:4222", "localhost:5222", "localhost:6222", "localhost:7222", "localhost:8222",
-		"localhost:9222", "localhost:10222", "localhost:11222")
-
-	// Finally, check that (part of) the pool should be randomized.
-	allUrls := []string{"localhost:4222", "localhost:5222", "localhost:6222", "localhost:7222", "localhost:8222",
-		"localhost:9222", "localhost:10222", "localhost:11222"}
-	same := 0
-	for i, url := range c.srvPool {
-		if url.url.Host == allUrls[i] {
-			same++
-		}
-	}
-	if same == len(allUrls) {
-		t.Fatal("Pool does not seem to be randomized")
-	}
+	// Pool now should contain 127.0.0.1:4222 (the default URL), localhost:4222, localhost:5222 and localhost:6222
+	checkPool("127.0.0.1:4222", "localhost:4222", "localhost:5222", "localhost:6222")
 
 	// Check that pool may be randomized on setup, but new URLs are always
 	// added at end of pool.
@@ -1123,7 +1141,7 @@ func TestConnServers(t *testing.T) {
 	}
 
 	// check the default url
-	validateURLs(c.Servers(), "nats://localhost:4222")
+	validateURLs(c.Servers(), "nats://127.0.0.1:4222")
 	if len(c.DiscoveredServers()) != 0 {
 		t.Fatalf("Expected no discovered servers")
 	}
@@ -1134,7 +1152,7 @@ func TestConnServers(t *testing.T) {
 		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
 	}
 	// Server list should now contain both the default and the new url.
-	validateURLs(c.Servers(), "nats://localhost:4222", "nats://localhost:5222")
+	validateURLs(c.Servers(), "nats://127.0.0.1:4222", "nats://localhost:5222")
 	// Discovered servers should only contain the new url.
 	validateURLs(c.DiscoveredServers(), "nats://localhost:5222")
 
@@ -1147,31 +1165,922 @@ func TestConnServers(t *testing.T) {
 	validateURLs(c.Servers(), "nats://localhost:4333", "nats://localhost:4444")
 }
 
-func TestProcessErrAuthorizationError(t *testing.T) {
-	ach := make(chan asyncCB, 1)
-	called := make(chan error, 1)
-	c := &Conn{
-		ach: ach,
-		Opts: Options{
-			AsyncErrorCB: func(nc *Conn, sub *Subscription, err error) {
-				called <- err
-			},
-		},
+func TestConnAsyncCBDeadlock(t *testing.T) {
+	s := RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+
+	ch := make(chan bool)
+	o := GetDefaultOptions()
+	o.Url = fmt.Sprintf("nats://127.0.0.1:%d", TEST_PORT)
+	o.ClosedCB = func(_ *Conn) {
+		ch <- true
 	}
-	c.processErr("Authorization Violation")
-	select {
-	case cb := <-ach:
-		cb()
-	default:
-		t.Fatal("Expected callback on channel")
+	o.AsyncErrorCB = func(nc *Conn, sub *Subscription, err error) {
+		// do something with nc that requires locking behind the scenes
+		_ = nc.LastError()
+	}
+	nc, err := o.Connect()
+	if err != nil {
+		t.Fatalf("Should have connected ok: %v", err)
 	}
 
-	select {
-	case err := <-called:
-		if err != ErrAuthorization {
-			t.Fatalf("Expected ErrAuthorization, got: %v", err)
+	total := 300
+	wg := &sync.WaitGroup{}
+	wg.Add(total)
+	for i := 0; i < total; i++ {
+		go func() {
+			// overwhelm asyncCB with errors
+			nc.processErr(AUTHORIZATION_ERR)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	nc.Close()
+	if e := Wait(ch); e != nil {
+		t.Fatal("Deadlock")
+	}
+}
+
+func TestPingTimerLeakedOnClose(t *testing.T) {
+	s := RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+
+	nc, err := Connect(fmt.Sprintf("nats://127.0.0.1:%d", TEST_PORT))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	nc.Close()
+	// There was a bug (issue #338) that if connection
+	// was created and closed quickly, the pinger would
+	// be created from a go-routine and would cause the
+	// connection object to be retained until the ping
+	// timer fired.
+	// Wait a little bit and check if the timer is set.
+	// With the defect it would be.
+	time.Sleep(100 * time.Millisecond)
+	nc.mu.Lock()
+	pingTimerSet := nc.ptmr != nil
+	nc.mu.Unlock()
+	if pingTimerSet {
+		t.Fatal("Pinger timer should not be set")
+	}
+}
+
+func TestNoEcho(t *testing.T) {
+	s := RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+
+	url := fmt.Sprintf("nats://127.0.0.1:%d", TEST_PORT)
+
+	nc, err := Connect(url, NoEcho())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	r := int32(0)
+	_, err = nc.Subscribe("foo", func(m *Msg) {
+		atomic.AddInt32(&r, 1)
+	})
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	err = nc.Publish("foo", []byte("Hello World"))
+	if err != nil {
+		t.Fatalf("Error on publish: %v", err)
+	}
+	nc.Flush()
+	nc.Flush()
+
+	if nr := atomic.LoadInt32(&r); nr != 0 {
+		t.Fatalf("Expected no messages echoed back, received %d\n", nr)
+	}
+}
+
+func TestNoEchoOldServer(t *testing.T) {
+	opts := GetDefaultOptions()
+	opts.Url = DefaultURL
+	opts.NoEcho = true
+
+	nc := &Conn{Opts: opts}
+	if err := nc.setupServerPool(); err != nil {
+		t.Fatalf("Problem setting up Server Pool: %v\n", err)
+	}
+
+	// Old style with no proto, meaning 0. We need Proto:1 for NoEcho support.
+	oldInfo := "{\"server_id\":\"22\",\"version\":\"1.1.0\",\"go\":\"go1.10.2\",\"port\":4222,\"max_payload\":1048576}"
+
+	err := nc.processInfo(oldInfo)
+	if err != nil {
+		t.Fatalf("Error processing old style INFO: %v\n", err)
+	}
+
+	// Make sure connectProto generates an error.
+	_, err = nc.connectProto()
+	if err == nil {
+		t.Fatalf("Expected an error but got none\n")
+	}
+}
+
+// Trust Server Tests
+
+var (
+	oSeed = []byte("SOAL7GTNI66CTVVNXBNQMG6V2HTDRWC3HGEP7D2OUTWNWSNYZDXWFOX4SU")
+	aSeed = []byte("SAAASUPRY3ONU4GJR7J5RUVYRUFZXG56F4WEXELLLORQ65AEPSMIFTOJGE")
+	uSeed = []byte("SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY")
+
+	aJWT = "eyJ0eXAiOiJqd3QiLCJhbGciOiJlZDI1NTE5In0.eyJqdGkiOiJLWjZIUVRXRlY3WkRZSFo3NklRNUhPM0pINDVRNUdJS0JNMzJTSENQVUJNNk5PNkU3TUhRIiwiaWF0IjoxNTQ0MDcxODg5LCJpc3MiOiJPRDJXMkk0TVZSQTVUR1pMWjJBRzZaSEdWTDNPVEtGV1FKRklYNFROQkVSMjNFNlA0NlMzNDVZWSIsInN1YiI6IkFBUFFKUVVQS1ZYR1c1Q1pINUcySEZKVUxZU0tERUxBWlJWV0pBMjZWRFpPN1dTQlVOSVlSRk5RIiwidHlwZSI6ImFjY291bnQiLCJuYXRzIjp7ImxpbWl0cyI6eyJzdWJzIjotMSwiY29ubiI6LTEsImltcG9ydHMiOi0xLCJleHBvcnRzIjotMSwiZGF0YSI6LTEsInBheWxvYWQiOi0xLCJ3aWxkY2FyZHMiOnRydWV9fX0.8o35JPQgvhgFT84Bi2Z-zAeSiLrzzEZn34sgr1DIBEDTwa-EEiMhvTeos9cvXxoZVCCadqZxAWVwS6paAMj8Bg"
+
+	uJWT = "eyJ0eXAiOiJqd3QiLCJhbGciOiJlZDI1NTE5In0.eyJqdGkiOiJBSFQzRzNXRElDS1FWQ1FUWFJUTldPRlVVUFRWNE00RFZQV0JGSFpJQUROWEZIWEpQR0FBIiwiaWF0IjoxNTQ0MDcxODg5LCJpc3MiOiJBQVBRSlFVUEtWWEdXNUNaSDVHMkhGSlVMWVNLREVMQVpSVldKQTI2VkRaTzdXU0JVTklZUkZOUSIsInN1YiI6IlVBVDZCV0NTQ1dMVUtKVDZLNk1CSkpPRU9UWFo1QUpET1lLTkVWUkZDN1ZOTzZPQTQzTjRUUk5PIiwidHlwZSI6InVzZXIiLCJuYXRzIjp7InB1YiI6e30sInN1YiI6e319fQ._8A1XM88Q2kp7XVJZ42bQuO9E3QPsNAGKtVjAkDycj8A5PtRPby9UpqBUZzBwiJQQO3TUcD5GGqSvsMm6X8hCQ"
+
+	chained = `
+-----BEGIN NATS USER JWT-----
+eyJ0eXAiOiJqd3QiLCJhbGciOiJlZDI1NTE5In0.eyJqdGkiOiJBSFQzRzNXRElDS1FWQ1FUWFJUTldPRlVVUFRWNE00RFZQV0JGSFpJQUROWEZIWEpQR0FBIiwiaWF0IjoxNTQ0MDcxODg5LCJpc3MiOiJBQVBRSlFVUEtWWEdXNUNaSDVHMkhGSlVMWVNLREVMQVpSVldKQTI2VkRaTzdXU0JVTklZUkZOUSIsInN1YiI6IlVBVDZCV0NTQ1dMVUtKVDZLNk1CSkpPRU9UWFo1QUpET1lLTkVWUkZDN1ZOTzZPQTQzTjRUUk5PIiwidHlwZSI6InVzZXIiLCJuYXRzIjp7InB1YiI6e30sInN1YiI6e319fQ._8A1XM88Q2kp7XVJZ42bQuO9E3QPsNAGKtVjAkDycj8A5PtRPby9UpqBUZzBwiJQQO3TUcD5GGqSvsMm6X8hCQ
+------END NATS USER JWT------
+
+************************* IMPORTANT *************************
+NKEY Seed printed below can be used to sign and prove identity.
+NKEYs are sensitive and should be treated as secrets.
+
+-----BEGIN USER NKEY SEED-----
+SUAMK2FG4MI6UE3ACF3FK3OIQBCEIEZV7NSWFFEW63UXMRLFM2XLAXK4GY
+------END USER NKEY SEED------
+`
+)
+
+func runTrustServer() *server.Server {
+	kp, _ := nkeys.FromSeed(oSeed)
+	pub, _ := kp.PublicKey()
+	opts := natsserver.DefaultTestOptions
+	opts.Port = TEST_PORT
+	opts.TrustedKeys = []string{string(pub)}
+	s := RunServerWithOptions(&opts)
+	mr := &server.MemAccResolver{}
+	akp, _ := nkeys.FromSeed(aSeed)
+	apub, _ := akp.PublicKey()
+	mr.Store(string(apub), aJWT)
+	s.SetAccountResolver(mr)
+	return s
+}
+
+func TestBasicUserJWTAuth(t *testing.T) {
+	if server.VERSION[0] == '1' {
+		t.Skip()
+	}
+	ts := runTrustServer()
+	defer ts.Shutdown()
+
+	url := fmt.Sprintf("nats://127.0.0.1:%d", TEST_PORT)
+	_, err := Connect(url)
+	if err == nil {
+		t.Fatalf("Expecting an error on connect")
+	}
+
+	jwtCB := func() (string, error) {
+		return uJWT, nil
+	}
+	sigCB := func(nonce []byte) ([]byte, error) {
+		kp, _ := nkeys.FromSeed(uSeed)
+		sig, _ := kp.Sign(nonce)
+		return sig, nil
+	}
+
+	// Try with user jwt but no sig
+	_, err = Connect(url, UserJWT(jwtCB, nil))
+	if err == nil {
+		t.Fatalf("Expecting an error on connect")
+	}
+
+	// Try with user callback
+	_, err = Connect(url, UserJWT(nil, sigCB))
+	if err == nil {
+		t.Fatalf("Expecting an error on connect")
+	}
+
+	nc, err := Connect(url, UserJWT(jwtCB, sigCB))
+	if err != nil {
+		t.Fatalf("Expected to connect, got %v", err)
+	}
+	nc.Close()
+}
+
+func TestUserCredentialsTwoFiles(t *testing.T) {
+	if server.VERSION[0] == '1' {
+		t.Skip()
+	}
+	ts := runTrustServer()
+	defer ts.Shutdown()
+
+	userJWTFile := createTmpFile(t, []byte(uJWT))
+	defer os.Remove(userJWTFile)
+	userSeedFile := createTmpFile(t, uSeed)
+	defer os.Remove(userSeedFile)
+
+	url := fmt.Sprintf("nats://127.0.0.1:%d", TEST_PORT)
+	nc, err := Connect(url, UserCredentials(userJWTFile, userSeedFile))
+	if err != nil {
+		t.Fatalf("Expected to connect, got %v", err)
+	}
+	nc.Close()
+}
+
+func TestUserCredentialsChainedFile(t *testing.T) {
+	if server.VERSION[0] == '1' {
+		t.Skip()
+	}
+	ts := runTrustServer()
+	defer ts.Shutdown()
+
+	chainedFile := createTmpFile(t, []byte(chained))
+	defer os.Remove(chainedFile)
+
+	url := fmt.Sprintf("nats://127.0.0.1:%d", TEST_PORT)
+	nc, err := Connect(url, UserCredentials(chainedFile))
+	if err != nil {
+		t.Fatalf("Expected to connect, got %v", err)
+	}
+	nc.Close()
+}
+
+func createNewUserKeys() (string, []byte) {
+	kp, _ := nkeys.CreateUser()
+	pub, _ := kp.PublicKey()
+	priv, _ := kp.Seed()
+	return pub, priv
+}
+
+func TestExpiredUserCredentials(t *testing.T) {
+	// The goal of this test was to check how a client with an expiring JWT
+	// behaves. It should receive an async -ERR indicating that the auth
+	// has expired, which will trigger reconnects. There, the lib should
+	// received -ERR for auth violation in response to the CONNECT (instead
+	// of the PONG). The library should close the connection after receiving
+	// twice the same auth error.
+	// If we use an actual JWT that expires, the way the JWT library expires
+	// a JWT cause the server to send the async -ERR first but then accepts
+	// the CONNECT (since JWT lib does not say that it has expired), but
+	// when the server sets up the expire callback, that callback fires right
+	// away and so client receives async -ERR again.
+	// So for a deterministic test, we won't use an actual NATS Server.
+	// Instead, we will use a mock that simply returns appropriate -ERR and
+	// ensure the client behaves as expected.
+	l, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal("Could not listen on an ephemeral port")
+	}
+	tl := l.(*net.TCPListener)
+	defer tl.Close()
+
+	addr := tl.Addr().(*net.TCPAddr)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		connect := 0
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			info := "INFO {\"server_id\":\"foobar\",\"nonce\":\"anonce\"}\r\n"
+			conn.Write([]byte(info))
+
+			// Read connect and ping commands sent from the client
+			br := bufio.NewReaderSize(conn, 10*1024)
+			br.ReadLine()
+			br.ReadLine()
+
+			if connect++; connect == 1 {
+				conn.Write([]byte(fmt.Sprintf("%s%s", _PONG_OP_, _CRLF_)))
+				time.Sleep(300 * time.Millisecond)
+				conn.Write([]byte(fmt.Sprintf("-ERR '%s'\r\n", AUTHENTICATION_EXPIRED_ERR)))
+			} else {
+				conn.Write([]byte(fmt.Sprintf("-ERR '%s'\r\n", AUTHORIZATION_ERR)))
+			}
+			conn.Close()
 		}
+	}()
+
+	ch := make(chan bool)
+	errCh := make(chan error, 10)
+
+	url := fmt.Sprintf("nats://127.0.0.1:%d", addr.Port)
+	nc, err := Connect(url,
+		ReconnectWait(25*time.Millisecond),
+		MaxReconnects(-1),
+		ErrorHandler(func(_ *Conn, _ *Subscription, e error) {
+			select {
+			case errCh <- e:
+			default:
+			}
+		}),
+		ClosedHandler(func(nc *Conn) {
+			ch <- true
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Expected to connect, got %v", err)
+	}
+	defer nc.Close()
+
+	// We should give up since we get the same error on both tries.
+	if err := WaitTime(ch, 2*time.Second); err != nil {
+		t.Fatal("Should have closed after multiple failed attempts.")
+	}
+	if stats := nc.Stats(); stats.Reconnects > 2 {
+		t.Fatalf("Expected at most 2 reconnects, got %d", stats.Reconnects)
+	}
+	// We expect 3 errors, an AUTHENTICATION_EXPIRED_ERR, then 2 AUTHORIZATION_ERR
+	// before the connection is closed.
+	for i := 0; i < 3; i++ {
+		select {
+		case e := <-errCh:
+			if i == 0 && e != ErrAuthExpired {
+				t.Fatalf("Expected error %q, got %q", ErrAuthExpired, e)
+			} else if i > 0 && e != ErrAuthorization {
+				t.Fatalf("Expected error %q, got %q", ErrAuthorization, e)
+			}
+		default:
+			if i == 0 {
+				t.Fatalf("Missing %q error", ErrAuthExpired)
+			} else {
+				t.Fatalf("Missing %q error", ErrAuthorization)
+			}
+		}
+	}
+	// We should not have any more error
+	select {
+	case e := <-errCh:
+		t.Fatalf("Extra error: %v", e)
 	default:
-		t.Fatal("Expected error on channel")
+	}
+	// Close the listener and wait for go routine to end.
+	l.Close()
+	wg.Wait()
+}
+
+func TestExpiredUserCredentialsRenewal(t *testing.T) {
+	if server.VERSION[0] == '1' {
+		t.Skip()
+	}
+	ts := runTrustServer()
+	defer ts.Shutdown()
+
+	// Create user credentials that will expire in a short timeframe.
+	pub, priv := createNewUserKeys()
+	nuc := jwt.NewUserClaims(pub)
+	nuc.Expires = time.Now().Add(time.Second).Unix()
+	akp, _ := nkeys.FromSeed(aSeed)
+	ujwt, err := nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error encoding user jwt: %v", err)
+	}
+	creds, err := jwt.FormatUserConfig(ujwt, priv)
+	if err != nil {
+		t.Fatalf("Error encoding credentials: %v", err)
+	}
+	chainedFile := createTmpFile(t, creds)
+	defer os.Remove(chainedFile)
+
+	rch := make(chan bool)
+
+	url := fmt.Sprintf("nats://127.0.0.1:%d", TEST_PORT)
+	nc, err := Connect(url,
+		UserCredentials(chainedFile),
+		ReconnectWait(25*time.Millisecond),
+		MaxReconnects(2),
+		ReconnectHandler(func(nc *Conn) {
+			rch <- true
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Expected to connect, got %v", err)
+	}
+	defer nc.Close()
+
+	// Place new credentials underneath.
+	nuc.Expires = time.Now().Add(30 * time.Second).Unix()
+	ujwt, err = nuc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error encoding user jwt: %v", err)
+	}
+	creds, err = jwt.FormatUserConfig(ujwt, priv)
+	if err != nil {
+		t.Fatalf("Error encoding credentials: %v", err)
+	}
+	if err := ioutil.WriteFile(chainedFile, creds, 0666); err != nil {
+		t.Fatalf("Error writing conf file: %v", err)
+	}
+
+	// Make sure we get disconnected and reconnected first.
+	if err := WaitTime(rch, 2*time.Second); err != nil {
+		t.Fatal("Should have reconnected.")
+	}
+
+	// We should not have been closed.
+	if nc.IsClosed() {
+		t.Fatal("Got disconnected when we should have reconnected.")
+	}
+
+	// Check that we clear the lastErr that can cause the disconnect.
+	// Our reconnect CB will happen before the clear. So check after a bit.
+	time.Sleep(50 * time.Millisecond)
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	if nc.current.lastErr != nil {
+		t.Fatalf("Expected lastErr to be cleared, got %q", nc.current.lastErr)
+	}
+}
+
+// If we are using TLS and have multiple servers we try to match the IP
+// from a discovered server with the expected hostname for certs without IP
+// designations. In certain cases where there is a not authorized error and
+// we were trying the second server with the IP only and getting an error
+// that was hard to understand for the end user. This did require
+// Opts.Secure = false, but the fix removed the check on Opts.Secure to decide
+// if we need to save off the hostname that we connected to first.
+func TestUserCredentialsChainedFileNotFoundError(t *testing.T) {
+	if server.VERSION[0] == '1' {
+		t.Skip()
+	}
+	// Setup opts for both servers.
+	kp, _ := nkeys.FromSeed(oSeed)
+	pub, _ := kp.PublicKey()
+	opts := natsserver.DefaultTestOptions
+	opts.Port = -1
+	opts.Cluster.Port = -1
+	opts.TrustedKeys = []string{string(pub)}
+	tc := &server.TLSConfigOpts{
+		CertFile: "./test/configs/certs/server_noip.pem",
+		KeyFile:  "./test/configs/certs/key_noip.pem",
+	}
+	var err error
+	if opts.TLSConfig, err = server.GenTLSConfig(tc); err != nil {
+		panic("Can't build TLCConfig")
+	}
+
+	// copy the opts for the second server.
+	opts2 := opts
+
+	sa := RunServerWithOptions(&opts)
+	defer sa.Shutdown()
+
+	routeAddr := fmt.Sprintf("nats-route://%s:%d", opts.Cluster.Host, opts.Cluster.Port)
+	rurl, _ := url.Parse(routeAddr)
+	opts2.Routes = []*url.URL{rurl}
+
+	sb := RunServerWithOptions(&opts2)
+	defer sb.Shutdown()
+
+	wait := time.Now().Add(2 * time.Second)
+	for time.Now().Before(wait) {
+		sanr := sa.NumRoutes()
+		sbnr := sb.NumRoutes()
+		if sanr == 1 && sbnr == 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Make sure we get the right error here.
+	nc, err := Connect(fmt.Sprintf("nats://localhost:%d", opts.Port),
+		RootCAs("./test/configs/certs/ca.pem"),
+		UserCredentials("filenotfound.creds"))
+
+	if err == nil {
+		nc.Close()
+		t.Fatalf("Expected an error on missing credentials file")
+	}
+	if !strings.Contains(err.Error(), "no such file or directory") {
+		t.Fatalf("Expected a missing file error, got %q", err)
+	}
+}
+
+func TestNkeyAuth(t *testing.T) {
+	if server.VERSION[0] == '1' {
+		t.Skip()
+	}
+
+	seed := []byte("SUAKYRHVIOREXV7EUZTBHUHL7NUMHPMAS7QMDU3GTIUWEI5LDNOXD43IZY")
+	kp, _ := nkeys.FromSeed(seed)
+	pub, _ := kp.PublicKey()
+
+	sopts := natsserver.DefaultTestOptions
+	sopts.Port = TEST_PORT
+	sopts.Nkeys = []*server.NkeyUser{&server.NkeyUser{Nkey: string(pub)}}
+	ts := RunServerWithOptions(&sopts)
+	defer ts.Shutdown()
+
+	opts := reconnectOpts
+	if _, err := opts.Connect(); err == nil {
+		t.Fatalf("Expected to fail with no nkey auth defined")
+	}
+	opts.Nkey = string(pub)
+	if _, err := opts.Connect(); err != ErrNkeyButNoSigCB {
+		t.Fatalf("Expected to fail with nkey defined but no signature callback, got %v", err)
+	}
+	badSign := func(nonce []byte) ([]byte, error) {
+		return []byte("VALID?"), nil
+	}
+	opts.SignatureCB = badSign
+	if _, err := opts.Connect(); err == nil {
+		t.Fatalf("Expected to fail with nkey and bad signature callback")
+	}
+	goodSign := func(nonce []byte) ([]byte, error) {
+		sig, err := kp.Sign(nonce)
+		if err != nil {
+			t.Fatalf("Failed signing nonce: %v", err)
+		}
+		return sig, nil
+	}
+	opts.SignatureCB = goodSign
+	nc, err := opts.Connect()
+	if err != nil {
+		t.Fatalf("Expected to succeed but got %v", err)
+	}
+	defer nc.Close()
+
+	// Now disconnect by killing the server and restarting.
+	ts.Shutdown()
+	ts = RunServerWithOptions(&sopts)
+	defer ts.Shutdown()
+
+	if err := nc.FlushTimeout(5 * time.Second); err != nil {
+		t.Fatalf("Error on Flush: %v", err)
+	}
+}
+
+func createTmpFile(t *testing.T, content []byte) string {
+	t.Helper()
+	conf, err := ioutil.TempFile("", "")
+	if err != nil {
+		t.Fatalf("Error creating conf file: %v", err)
+	}
+	fName := conf.Name()
+	conf.Close()
+	if err := ioutil.WriteFile(fName, content, 0666); err != nil {
+		os.Remove(fName)
+		t.Fatalf("Error writing conf file: %v", err)
+	}
+	return fName
+}
+
+func TestNKeyOptionFromSeed(t *testing.T) {
+	if _, err := NkeyOptionFromSeed("file_that_does_not_exist"); err == nil {
+		t.Fatal("Expected error got none")
+	}
+
+	seedFile := createTmpFile(t, []byte(`
+		# No seed
+		THIS_NOT_A_NKEY_SEED
+	`))
+	defer os.Remove(seedFile)
+	if _, err := NkeyOptionFromSeed(seedFile); err == nil || !strings.Contains(err.Error(), "seed found") {
+		t.Fatalf("Expected error about seed not found, got %v", err)
+	}
+	os.Remove(seedFile)
+
+	seedFile = createTmpFile(t, []byte(`
+		# Invalid seed
+		SUBADSEED
+	`))
+	// Make sure that we detect SU (trim space) but it still fails because
+	// this is not a valid NKey.
+	if _, err := NkeyOptionFromSeed(seedFile); err == nil || strings.Contains(err.Error(), "seed found") {
+		t.Fatalf("Expected error about invalid key, got %v", err)
+	}
+	os.Remove(seedFile)
+
+	kp, _ := nkeys.CreateUser()
+	seed, _ := kp.Seed()
+	seedFile = createTmpFile(t, seed)
+	opt, err := NkeyOptionFromSeed(seedFile)
+	if err != nil {
+		t.Fatalf("Error: %v", err)
+	}
+
+	l, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal("Could not listen on an ephemeral port")
+	}
+	tl := l.(*net.TCPListener)
+	defer tl.Close()
+
+	addr := tl.Addr().(*net.TCPAddr)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	ch := make(chan bool, 1)
+	rs := func(ch chan bool) {
+		defer wg.Done()
+		conn, err := l.Accept()
+		if err != nil {
+			t.Fatalf("Error accepting client connection: %v\n", err)
+		}
+		defer conn.Close()
+		info := "INFO {\"server_id\":\"foobar\",\"nonce\":\"anonce\"}\r\n"
+		conn.Write([]byte(info))
+
+		// Read connect and ping commands sent from the client
+		br := bufio.NewReaderSize(conn, 10*1024)
+		line, _, _ := br.ReadLine()
+		if err != nil {
+			t.Fatalf("Expected CONNECT and PING from client, got: %s", err)
+		}
+		// If client got an error reading the seed, it will not send it
+		if bytes.Contains(line, []byte(`"sig":`)) {
+			conn.Write([]byte("PONG\r\n"))
+		} else {
+			conn.Write([]byte(`-ERR go away\r\n`))
+			conn.Close()
+		}
+		// Now wait to be notified that we can finish
+		<-ch
+	}
+	//lint:ignore SA2002 t.Fatalf in go routine will happen only if test fails
+	go rs(ch)
+
+	nc, err := Connect(fmt.Sprintf("nats://127.0.0.1:%d", addr.Port), opt)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	nc.Close()
+	close(ch)
+	wg.Wait()
+
+	// Now that option is already created, change content of file
+	ioutil.WriteFile(seedFile, []byte(`xxxxx`), 0666)
+	ch = make(chan bool, 1)
+	wg.Add(1)
+	//lint:ignore SA2002 t.Fatalf in go routine will happen only if test fails
+	go rs(ch)
+
+	if _, err := Connect(fmt.Sprintf("nats://127.0.0.1:%d", addr.Port), opt); err == nil {
+		t.Fatal("Expected error, got none")
+	}
+	close(ch)
+	wg.Wait()
+}
+
+func TestLookupHostResultIsRandomized(t *testing.T) {
+	orgAddrs, err := net.LookupHost("localhost")
+	if err != nil {
+		t.Fatalf("Error looking up host: %v", err)
+	}
+
+	// We actually want the IPv4 and IPv6 addresses, so lets make sure.
+	if !reflect.DeepEqual(orgAddrs, []string{"::1", "127.0.0.1"}) {
+		t.Skip("Was looking for IPv4 and IPv6 addresses for localhost to perform test")
+	}
+
+	opts := natsserver.DefaultTestOptions
+	opts.Host = "127.0.0.1"
+	opts.Port = TEST_PORT
+	s1 := RunServerWithOptions(&opts)
+	defer s1.Shutdown()
+
+	opts.Host = "::1"
+	s2 := RunServerWithOptions(&opts)
+	defer s2.Shutdown()
+
+	for i := 0; i < 100; i++ {
+		nc, err := Connect(fmt.Sprintf("localhost:%d", TEST_PORT))
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		defer nc.Close()
+	}
+
+	if ncls := s1.NumClients(); ncls < 35 || ncls > 65 {
+		t.Fatalf("Does not seem balanced between multiple servers: s1:%d, s2:%d", s1.NumClients(), s2.NumClients())
+	}
+}
+
+func TestLookupHostResultIsNotRandomizedWithNoRandom(t *testing.T) {
+	orgAddrs, err := net.LookupHost("localhost")
+	if err != nil {
+		t.Fatalf("Error looking up host: %v", err)
+	}
+
+	// We actually want the IPv4 and IPv6 addresses, so lets make sure.
+	if !reflect.DeepEqual(orgAddrs, []string{"::1", "127.0.0.1"}) {
+		t.Skip("Was looking for IPv4 and IPv6 addresses for localhost to perform test")
+	}
+
+	opts := natsserver.DefaultTestOptions
+	opts.Host = orgAddrs[0]
+	opts.Port = TEST_PORT
+	s1 := RunServerWithOptions(&opts)
+	defer s1.Shutdown()
+
+	opts.Host = orgAddrs[1]
+	s2 := RunServerWithOptions(&opts)
+	defer s2.Shutdown()
+
+	for i := 0; i < 100; i++ {
+		nc, err := Connect(fmt.Sprintf("localhost:%d", TEST_PORT), DontRandomize())
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		defer nc.Close()
+	}
+
+	if ncls := s1.NumClients(); ncls != 100 {
+		t.Fatalf("Expected all clients on first server, only got %d of 100", ncls)
+	}
+}
+
+func TestConnectedAddr(t *testing.T) {
+	s := RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+
+	var nc *Conn
+	if addr := nc.ConnectedAddr(); addr != _EMPTY_ {
+		t.Fatalf("Expected empty result for nil connection, got %q", addr)
+	}
+	nc, err := Connect(fmt.Sprintf("localhost:%d", TEST_PORT))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+	expected := s.Addr().String()
+	if addr := nc.ConnectedAddr(); addr != expected {
+		t.Fatalf("Expected address %q, got %q", expected, addr)
+	}
+	nc.Close()
+	if addr := nc.ConnectedAddr(); addr != _EMPTY_ {
+		t.Fatalf("Expected empty result for closed connection, got %q", addr)
+	}
+}
+
+func TestSubscribeSyncRace(t *testing.T) {
+	s := RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+
+	nc, err := Connect(fmt.Sprintf("127.0.0.1:%d", TEST_PORT))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	go func() {
+		time.Sleep(time.Millisecond)
+		nc.Close()
+	}()
+
+	subj := "foo.sync.race"
+	for i := 0; i < 10000; i++ {
+		if _, err := nc.SubscribeSync(subj); err != nil {
+			break
+		}
+		if _, err := nc.QueueSubscribeSync(subj, "gc"); err != nil {
+			break
+		}
+	}
+}
+
+func TestBadSubjectsAndQueueNames(t *testing.T) {
+	s := RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+
+	nc, err := Connect(fmt.Sprintf("127.0.0.1:%d", TEST_PORT))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+	defer nc.Close()
+
+	// Make sure we get errors on bad subjects (spaces, etc)
+	// We want the client to protect the user.
+	badSubs := []string{"foo bar", "foo..bar", ".foo", "bar.baz.", "baz\t.foo"}
+	for _, subj := range badSubs {
+		if _, err := nc.SubscribeSync(subj); err != ErrBadSubject {
+			t.Fatalf("Expected an error of ErrBadSubject for %q, got %v", subj, err)
+		}
+	}
+
+	badQueues := []string{"foo group", "group\t1", "g1\r\n2"}
+	for _, q := range badQueues {
+		if _, err := nc.QueueSubscribeSync("foo", q); err != ErrBadQueueName {
+			t.Fatalf("Expected an error of ErrBadQueueName for %q, got %v", q, err)
+		}
+	}
+}
+
+func BenchmarkNextMsgNoTimeout(b *testing.B) {
+	s := RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+
+	ncp, err := Connect(fmt.Sprintf("127.0.0.1:%d", TEST_PORT))
+	if err != nil {
+		b.Fatalf("Error connecting: %v", err)
+	}
+	ncs, err := Connect(fmt.Sprintf("127.0.0.1:%d", TEST_PORT), SyncQueueLen(b.N))
+	if err != nil {
+		b.Fatalf("Error connecting: %v", err)
+	}
+
+	// Test processing speed so no long subject or payloads.
+	subj := "a"
+
+	sub, err := ncs.SubscribeSync(subj)
+	if err != nil {
+		b.Fatalf("Error subscribing: %v", err)
+	}
+	ncs.Flush()
+
+	// Set it up so we can internally queue all the messages.
+	sub.SetPendingLimits(b.N, b.N*1000)
+
+	for i := 0; i < b.N; i++ {
+		ncp.Publish(subj, nil)
+	}
+	ncp.Flush()
+
+	// Wait for them to all be queued up, testing NextMsg not server here.
+	// Only wait at most one second.
+	wait := time.Now().Add(time.Second)
+	for time.Now().Before(wait) {
+		nm, _, err := sub.Pending()
+		if err != nil {
+			b.Fatalf("Error on Pending() - %v", err)
+		}
+		if nm >= b.N {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := sub.NextMsg(10 * time.Millisecond); err != nil {
+			b.Fatalf("Error getting message[%d]: %v", i, err)
+		}
+	}
+}
+
+func TestAuthErrorOnReconnect(t *testing.T) {
+	// This is a bit of an artificial test, but it is to demonstrate
+	// that if the client is disconnected from a server (not due to an auth error),
+	// it will still correctly stop the reconnection logic if it gets twice an
+	// auth error from the same server.
+
+	o1 := natsserver.DefaultTestOptions
+	o1.Port = -1
+	s1 := RunServerWithOptions(&o1)
+	defer s1.Shutdown()
+
+	o2 := natsserver.DefaultTestOptions
+	o2.Port = -1
+	o2.Username = "ivan"
+	o2.Password = "pwd"
+	s2 := RunServerWithOptions(&o2)
+	defer s2.Shutdown()
+
+	dch := make(chan bool)
+	cch := make(chan bool)
+
+	urls := fmt.Sprintf("nats://%s:%d, nats://%s:%d", o1.Host, o1.Port, o2.Host, o2.Port)
+	nc, err := Connect(urls,
+		ReconnectWait(25*time.Millisecond),
+		MaxReconnects(-1),
+		DontRandomize(),
+		DisconnectErrHandler(func(_ *Conn, e error) {
+			dch <- true
+		}),
+		ClosedHandler(func(_ *Conn) {
+			cch <- true
+		}))
+	if err != nil {
+		t.Fatalf("Expected to connect, got err: %v\n", err)
+	}
+	defer nc.Close()
+
+	s1.Shutdown()
+
+	// wait for disconnect
+	if e := WaitTime(dch, 5*time.Second); e != nil {
+		t.Fatal("Did not receive a disconnect callback message")
+	}
+
+	// Wait for ClosedCB
+	if e := WaitTime(cch, 5*time.Second); e != nil {
+		reconnects := nc.Stats().Reconnects
+		t.Fatalf("Did not receive a closed callback message, #reconnects: %v", reconnects)
+	}
+
+	// We should have stopped after 2 reconnects.
+	if reconnects := nc.Stats().Reconnects; reconnects != 2 {
+		t.Fatalf("Expected 2 reconnects, got %v", reconnects)
+	}
+
+	// Expect connection to be closed...
+	if !nc.IsClosed() {
+		t.Fatalf("Wrong status: %d\n", nc.Status())
 	}
 }

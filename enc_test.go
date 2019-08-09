@@ -1,3 +1,16 @@
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package nats_test
 
 import (
@@ -5,9 +18,9 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/nats-io/go-nats"
-	"github.com/nats-io/go-nats/encoders/protobuf"
-	"github.com/nats-io/go-nats/encoders/protobuf/testdata"
+	. "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/encoders/protobuf"
+	"github.com/nats-io/nats.go/encoders/protobuf/testdata"
 )
 
 // Since we import above nats packages, we need to have a different
@@ -15,7 +28,7 @@ import (
 const ENC_TEST_PORT = 8268
 
 var options = Options{
-	Url:            fmt.Sprintf("nats://localhost:%d", ENC_TEST_PORT),
+	Url:            fmt.Sprintf("nats://127.0.0.1:%d", ENC_TEST_PORT),
 	AllowReconnect: true,
 	MaxReconnect:   10,
 	ReconnectWait:  100 * time.Millisecond,
@@ -42,11 +55,11 @@ func TestPublishErrorAfterSubscribeDecodeError(t *testing.T) {
 
 	c.Subscribe(testSubj, func(msg *Message) {})
 
-	//Publish invalid json to catch decode error in subscription callback
+	// Publish invalid json to catch decode error in subscription callback
 	c.Publish(testSubj, `foo`)
 	c.Flush()
 
-	//Next publish should be successful
+	// Next publish should be successful
 	if err := c.Publish(testSubj, Message{"2"}); err != nil {
 		t.Error("Fail to send correct json message after decode error in subscription")
 	}
@@ -63,10 +76,10 @@ func TestPublishErrorAfterInvalidPublishMessage(t *testing.T) {
 
 	c.Publish(testSubj, &testdata.Person{Name: "Anatolii"})
 
-	//Publish invalid protobuff message to catch decode error
+	// Publish invalid protobuf message to catch decode error
 	c.Publish(testSubj, "foo")
 
-	//Next publish with valid protobuf message should be successful
+	// Next publish with valid protobuf message should be successful
 	if err := c.Publish(testSubj, &testdata.Person{Name: "Anatolii"}); err != nil {
 		t.Error("Fail to send correct protobuf message after invalid message publishing", err)
 	}
@@ -253,5 +266,47 @@ func TestRequest(t *testing.T) {
 	}
 	if c2.LastError() != nil {
 		t.Fatalf("Unexpected connection error: %v", c2.LastError())
+	}
+}
+
+func TestRequestGOB(t *testing.T) {
+	ts := RunServerOnPort(ENC_TEST_PORT)
+	defer ts.Shutdown()
+
+	type Request struct {
+		Name string
+	}
+
+	type Person struct {
+		Name string
+		Age  int
+	}
+
+	nc, err := Connect(options.Url)
+	if err != nil {
+		t.Fatalf("Could not connect: %v", err)
+	}
+	defer nc.Close()
+
+	ec, err := NewEncodedConn(nc, GOB_ENCODER)
+	if err != nil {
+		t.Fatalf("Unable to create encoded connection: %v", err)
+	}
+	defer ec.Close()
+
+	ec.QueueSubscribe("foo.request", "g", func(subject, reply string, r *Request) {
+		if r.Name != "meg" {
+			t.Fatalf("Expected request to be 'meg', got %q", r)
+		}
+		response := &Person{Name: "meg", Age: 21}
+		ec.Publish(reply, response)
+	})
+
+	reply := Person{}
+	if err := ec.Request("foo.request", &Request{Name: "meg"}, &reply, time.Second); err != nil {
+		t.Fatalf("Failed to receive response: %v", err)
+	}
+	if reply.Name != "meg" || reply.Age != 21 {
+		t.Fatalf("Did not receive proper response, %+v", reply)
 	}
 }

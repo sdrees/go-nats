@@ -1,29 +1,55 @@
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package test
 
 import (
+	"fmt"
 	"math"
-	"regexp"
+	"net"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nats.go"
 )
 
 var testServers = []string{
-	"nats://localhost:1222",
-	"nats://localhost:1223",
-	"nats://localhost:1224",
-	"nats://localhost:1225",
-	"nats://localhost:1226",
-	"nats://localhost:1227",
-	"nats://localhost:1228",
+	"nats://127.0.0.1:1222",
+	"nats://127.0.0.1:1223",
+	"nats://127.0.0.1:1224",
+	"nats://127.0.0.1:1225",
+	"nats://127.0.0.1:1226",
+	"nats://127.0.0.1:1227",
+	"nats://127.0.0.1:1228",
 }
 
 var servers = strings.Join(testServers, ",")
+
+func serverVersionAtLeast(major, minor, update int) error {
+	var (
+		ma, mi, up int
+	)
+	fmt.Sscanf(server.VERSION, "%d.%d.%d", &ma, &mi, &up)
+	if ma > major || (ma == major && mi > minor) || (ma == major && mi == minor && up >= update) {
+		return nil
+	}
+	return fmt.Errorf("Server version is %v, requires %d.%d.%d+", server.VERSION, major, minor, update)
+}
 
 func TestServersOption(t *testing.T) {
 	opts := nats.GetDefaultOptions()
@@ -48,7 +74,7 @@ func TestServersOption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Could not connect: %v\n", err)
 	}
-	if nc.ConnectedUrl() != "nats://localhost:1222" {
+	if nc.ConnectedUrl() != "nats://127.0.0.1:1222" {
 		nc.Close()
 		t.Fatalf("Does not report correct connection: %s\n",
 			nc.ConnectedUrl())
@@ -66,7 +92,7 @@ func TestServersOption(t *testing.T) {
 		t.Fatalf("Could not connect: %v\n", err)
 	}
 	defer nc.Close()
-	if nc.ConnectedUrl() != "nats://localhost:1223" {
+	if nc.ConnectedUrl() != "nats://127.0.0.1:1223" {
 		t.Fatalf("Does not report correct connection: %s\n",
 			nc.ConnectedUrl())
 	}
@@ -93,7 +119,7 @@ func TestNewStyleServersOption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Could not connect: %v\n", err)
 	}
-	if nc.ConnectedUrl() != "nats://localhost:1222" {
+	if nc.ConnectedUrl() != "nats://127.0.0.1:1222" {
 		nc.Close()
 		t.Fatalf("Does not report correct connection: %s\n",
 			nc.ConnectedUrl())
@@ -111,7 +137,7 @@ func TestNewStyleServersOption(t *testing.T) {
 		t.Fatalf("Could not connect: %v\n", err)
 	}
 	defer nc.Close()
-	if nc.ConnectedUrl() != "nats://localhost:1223" {
+	if nc.ConnectedUrl() != "nats://127.0.0.1:1223" {
 		t.Fatalf("Does not report correct connection: %s\n",
 			nc.ConnectedUrl())
 	}
@@ -119,8 +145,8 @@ func TestNewStyleServersOption(t *testing.T) {
 
 func TestAuthServers(t *testing.T) {
 	var plainServers = []string{
-		"nats://localhost:1222",
-		"nats://localhost:1224",
+		"nats://127.0.0.1:1222",
+		"nats://127.0.0.1:1224",
 	}
 
 	opts := test.DefaultTestOptions
@@ -141,14 +167,14 @@ func TestAuthServers(t *testing.T) {
 		t.Fatalf("Expect Auth failure, got no error\n")
 	}
 
-	if matched, _ := regexp.Match(`authorization`, []byte(err.Error())); !matched {
+	if !strings.Contains(err.Error(), "Authorization") {
 		t.Fatalf("Wrong error, wanted Auth failure, got '%s'\n", err)
 	}
 
 	// Test that we can connect to a subsequent correct server.
 	var authServers = []string{
-		"nats://localhost:1222",
-		"nats://derek:foo@localhost:1224",
+		"nats://127.0.0.1:1222",
+		"nats://derek:foo@127.0.0.1:1224",
 	}
 	aservers := strings.Join(authServers, ",")
 	nc, err = nats.Connect(aservers, nats.DontRandomize(), nats.Timeout(5*time.Second))
@@ -174,7 +200,7 @@ func TestBasicClusterReconnect(t *testing.T) {
 	dcbCalled := false
 
 	opts := []nats.Option{nats.DontRandomize(),
-		nats.DisconnectHandler(func(nc *nats.Conn) {
+		nats.DisconnectErrHandler(func(nc *nats.Conn, _ error) {
 			// Suppress any additional callbacks
 			if dcbCalled {
 				return
@@ -365,7 +391,7 @@ func TestProperFalloutAfterMaxAttempts(t *testing.T) {
 	opts.ReconnectWait = (25 * time.Millisecond)
 
 	dch := make(chan bool)
-	opts.DisconnectedCB = func(_ *nats.Conn) {
+	opts.DisconnectedErrCB = func(_ *nats.Conn, _ error) {
 		dch <- true
 	}
 
@@ -412,8 +438,8 @@ func TestProperFalloutAfterMaxAttempts(t *testing.T) {
 
 func TestProperFalloutAfterMaxAttemptsWithAuthMismatch(t *testing.T) {
 	var myServers = []string{
-		"nats://localhost:1222",
-		"nats://localhost:4443",
+		"nats://127.0.0.1:1222",
+		"nats://127.0.0.1:4443",
 	}
 	s1 := RunServerOnPort(1222)
 	defer s1.Shutdown()
@@ -432,7 +458,7 @@ func TestProperFalloutAfterMaxAttemptsWithAuthMismatch(t *testing.T) {
 	opts.ReconnectWait = (25 * time.Millisecond)
 
 	dch := make(chan bool)
-	opts.DisconnectedCB = func(_ *nats.Conn) {
+	opts.DisconnectedErrCB = func(_ *nats.Conn, _ error) {
 		dch <- true
 	}
 
@@ -502,9 +528,9 @@ func TestTimeoutOnNoServers(t *testing.T) {
 	opts.NoRandomize = true
 
 	dch := make(chan bool)
-	opts.DisconnectedCB = func(nc *nats.Conn) {
+	opts.DisconnectedErrCB = func(nc *nats.Conn, _ error) {
 		// Suppress any additional calls
-		nc.SetDisconnectHandler(nil)
+		nc.SetDisconnectErrHandler(nil)
 		dch <- true
 	}
 
@@ -566,7 +592,7 @@ func TestPingReconnect(t *testing.T) {
 	rch := make(chan time.Time, RECONNECTS)
 	dch := make(chan time.Time, RECONNECTS)
 
-	opts.DisconnectedCB = func(_ *nats.Conn) {
+	opts.DisconnectedErrCB = func(_ *nats.Conn, _ error) {
 		d := dch
 		select {
 		case d <- time.Now():
@@ -603,4 +629,231 @@ func TestPingReconnect(t *testing.T) {
 			t.Fatalf("Reconnect due to ping took %s", pingCycle.String())
 		}
 	}
+}
+
+type checkPoolUpdatedDialer struct {
+	conn         net.Conn
+	first, final bool
+	ra           int
+}
+
+func (d *checkPoolUpdatedDialer) Dial(network, address string) (net.Conn, error) {
+	doReal := false
+	if d.first {
+		d.first = false
+		doReal = true
+	} else if d.final {
+		d.ra++
+		return nil, fmt.Errorf("On purpose")
+	} else {
+		d.ra++
+		if d.ra == 15 {
+			d.ra = 0
+			doReal = true
+		}
+	}
+	if doReal {
+		c, err := net.Dial(network, address)
+		if err != nil {
+			return nil, err
+		}
+		d.conn = c
+		return c, nil
+	}
+	return nil, fmt.Errorf("On purpose")
+}
+
+func TestServerPoolUpdatedWhenRouteGoesAway(t *testing.T) {
+	if err := serverVersionAtLeast(1, 0, 7); err != nil {
+		t.Skipf(err.Error())
+	}
+	s1Opts := test.DefaultTestOptions
+	s1Opts.Host = "127.0.0.1"
+	s1Opts.Port = 4222
+	s1Opts.Cluster.Host = "127.0.0.1"
+	s1Opts.Cluster.Port = 6222
+	s1Opts.Routes = server.RoutesFromStr("nats://127.0.0.1:6223,nats://127.0.0.1:6224")
+	s1 := test.RunServer(&s1Opts)
+	defer s1.Shutdown()
+
+	s1Url := "nats://127.0.0.1:4222"
+	s2Url := "nats://127.0.0.1:4223"
+	s3Url := "nats://127.0.0.1:4224"
+
+	ch := make(chan bool, 1)
+	chch := make(chan bool, 1)
+	connHandler := func(_ *nats.Conn) {
+		chch <- true
+	}
+	nc, err := nats.Connect(s1Url,
+		nats.ReconnectHandler(connHandler),
+		nats.DiscoveredServersHandler(func(_ *nats.Conn) {
+			ch <- true
+		}))
+	if err != nil {
+		t.Fatalf("Error on connect")
+	}
+
+	s2Opts := test.DefaultTestOptions
+	s2Opts.Host = "127.0.0.1"
+	s2Opts.Port = s1Opts.Port + 1
+	s2Opts.Cluster.Host = "127.0.0.1"
+	s2Opts.Cluster.Port = 6223
+	s2Opts.Routes = server.RoutesFromStr("nats://127.0.0.1:6222,nats://127.0.0.1:6224")
+	s2 := test.RunServer(&s2Opts)
+	defer s2.Shutdown()
+
+	// Wait to be notified
+	if err := Wait(ch); err != nil {
+		t.Fatal("New server callback was not invoked")
+	}
+
+	checkPool := func(expected []string) {
+		// Don't use discovered here, but Servers to have the full list.
+		// Also, there may be cases where the mesh is not formed yet,
+		// so try again on failure.
+		var (
+			ds      []string
+			timeout = time.Now().Add(5 * time.Second)
+		)
+		for time.Now().Before(timeout) {
+			ds = nc.Servers()
+			if len(ds) == len(expected) {
+				m := make(map[string]struct{}, len(ds))
+				for _, url := range ds {
+					m[url] = struct{}{}
+				}
+				ok := true
+				for _, url := range expected {
+					if _, present := m[url]; !present {
+						ok = false
+						break
+					}
+				}
+				if ok {
+					return
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		stackFatalf(t, "Expected %v, got %v", expected, ds)
+	}
+	// Verify that we now know about s2
+	checkPool([]string{s1Url, s2Url})
+
+	s3Opts := test.DefaultTestOptions
+	s3Opts.Host = "127.0.0.1"
+	s3Opts.Port = s2Opts.Port + 1
+	s3Opts.Cluster.Host = "127.0.0.1"
+	s3Opts.Cluster.Port = 6224
+	s3Opts.Routes = server.RoutesFromStr("nats://127.0.0.1:6222,nats://127.0.0.1:6223")
+	s3 := test.RunServer(&s3Opts)
+	defer s3.Shutdown()
+
+	// Wait to be notified
+	if err := Wait(ch); err != nil {
+		t.Fatal("New server callback was not invoked")
+	}
+	// Verify that we now know about s3
+	checkPool([]string{s1Url, s2Url, s3Url})
+
+	// Stop s1. Since this was passed to the Connect() call, this one should
+	// still be present.
+	s1.Shutdown()
+	// Wait for reconnect
+	if err := Wait(chch); err != nil {
+		t.Fatal("Reconnect handler not invoked")
+	}
+	checkPool([]string{s1Url, s2Url, s3Url})
+
+	// Check the server we reconnected to.
+	reConnectedTo := nc.ConnectedUrl()
+	expected := []string{s1Url}
+	restartS2 := false
+	if reConnectedTo == s2Url {
+		restartS2 = true
+		s2.Shutdown()
+		expected = append(expected, s3Url)
+	} else if reConnectedTo == s3Url {
+		s3.Shutdown()
+		expected = append(expected, s2Url)
+	} else {
+		t.Fatalf("Unexpected server client has reconnected to: %v", reConnectedTo)
+	}
+	// Wait for reconnect
+	if err := Wait(chch); err != nil {
+		t.Fatal("Reconnect handler not invoked")
+	}
+	// The implicit server that we just shutdown should have been removed from the pool
+	checkPool(expected)
+
+	// Restart the one that was shutdown and check that it is now back in the pool
+	if restartS2 {
+		s2 = test.RunServer(&s2Opts)
+		defer s2.Shutdown()
+		expected = append(expected, s2Url)
+	} else {
+		s3 = test.RunServer(&s3Opts)
+		defer s3.Shutdown()
+		expected = append(expected, s3Url)
+	}
+	// Since this is not a "new" server, the DiscoveredServersCB won't be invoked.
+	checkPool(expected)
+
+	nc.Close()
+
+	// Restart s1
+	s1 = test.RunServer(&s1Opts)
+	defer s1.Shutdown()
+
+	// We should have all 3 servers running now...
+
+	// Create a client connection with special dialer.
+	d := &checkPoolUpdatedDialer{first: true}
+	nc, err = nats.Connect(s1Url,
+		nats.MaxReconnects(10),
+		nats.ReconnectWait(15*time.Millisecond),
+		nats.SetCustomDialer(d),
+		nats.ReconnectHandler(connHandler),
+		nats.ClosedHandler(connHandler))
+	if err != nil {
+		t.Fatalf("Error on connect")
+	}
+	defer nc.Close()
+
+	// Make sure that we have all 3 servers in the pool (this will wait if required)
+	checkPool(expected)
+
+	// Cause disconnection between client and server. We are going to reconnect
+	// and we want to check that when we get the INFO again with the list of
+	// servers, we don't lose the knowledge of how many times we tried to
+	// reconnect.
+	d.conn.Close()
+
+	// Wait for client to reconnect to a server
+	if err := Wait(chch); err != nil {
+		t.Fatal("Reconnect handler not invoked")
+	}
+	// At this point, we should have tried to reconnect 5 times to each server.
+	// For the one we reconnected to, its max reconnect attempts should have been
+	// cleared, not for the other ones.
+
+	// Cause a disconnect again and ensure we won't reconnect.
+	d.final = true
+	d.conn.Close()
+
+	// Wait for Close callback to be invoked.
+	if err := Wait(chch); err != nil {
+		t.Fatal("Close handler not invoked")
+	}
+
+	// Since MaxReconnect is 10, after trying 5 more times on 2 of the servers,
+	// these should have been removed. We have still 5 more tries for the server
+	// we did previously reconnect to.
+	// So total of reconnect attempt should be: 2*5+1*10=20
+	if d.ra != 20 {
+		t.Fatalf("Should have tried to reconnect 20 more times, got %v", d.ra)
+	}
+
+	nc.Close()
 }

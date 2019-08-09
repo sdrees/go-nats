@@ -1,13 +1,29 @@
+// Copyright 2013-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package test
 
 import (
+	"fmt"
+	"net"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 )
 
 func startReconnectServer(t *testing.T) *server.Server {
@@ -29,7 +45,7 @@ func TestReconnectDisallowedFlags(t *testing.T) {
 
 	ch := make(chan bool)
 	opts := nats.GetDefaultOptions()
-	opts.Url = "nats://localhost:22222"
+	opts.Url = "nats://127.0.0.1:22222"
 	opts.AllowReconnect = false
 	opts.ClosedCB = func(_ *nats.Conn) {
 		ch <- true
@@ -53,7 +69,7 @@ func TestReconnectAllowedFlags(t *testing.T) {
 	ch := make(chan bool)
 	dch := make(chan bool)
 	opts := nats.GetDefaultOptions()
-	opts.Url = "nats://localhost:22222"
+	opts.Url = "nats://127.0.0.1:22222"
 	opts.AllowReconnect = true
 	opts.MaxReconnect = 2
 	opts.ReconnectWait = 1 * time.Second
@@ -61,7 +77,7 @@ func TestReconnectAllowedFlags(t *testing.T) {
 	opts.ClosedCB = func(_ *nats.Conn) {
 		ch <- true
 	}
-	opts.DisconnectedCB = func(_ *nats.Conn) {
+	opts.DisconnectedErrCB = func(_ *nats.Conn, _ error) {
 		dch <- true
 	}
 	nc, err := opts.Connect()
@@ -81,7 +97,7 @@ func TestReconnectAllowedFlags(t *testing.T) {
 	// We should wait to get the disconnected callback to ensure
 	// that we are in the process of reconnecting.
 	if e := Wait(dch); e != nil {
-		t.Fatal("DisconnectedCB should have been triggered")
+		t.Fatal("DisconnectedErrCB should have been triggered")
 	}
 
 	if !nc.IsReconnecting() {
@@ -93,7 +109,7 @@ func TestReconnectAllowedFlags(t *testing.T) {
 }
 
 var reconnectOpts = nats.Options{
-	Url:            "nats://localhost:22222",
+	Url:            "nats://127.0.0.1:22222",
 	AllowReconnect: true,
 	MaxReconnect:   10,
 	ReconnectWait:  100 * time.Millisecond,
@@ -147,7 +163,7 @@ func TestBasicReconnectFunctionality(t *testing.T) {
 
 	opts := reconnectOpts
 
-	opts.DisconnectedCB = func(_ *nats.Conn) {
+	opts.DisconnectedErrCB = func(_ *nats.Conn, _ error) {
 		dch <- true
 	}
 
@@ -207,7 +223,7 @@ func TestExtendedReconnectFunctionality(t *testing.T) {
 
 	opts := reconnectOpts
 	dch := make(chan bool)
-	opts.DisconnectedCB = func(_ *nats.Conn) {
+	opts.DisconnectedErrCB = func(_ *nats.Conn, _ error) {
 		dch <- true
 	}
 	rch := make(chan bool)
@@ -415,12 +431,12 @@ func TestIsReconnectingAndStatus(t *testing.T) {
 	disconnectedch := make(chan bool)
 	reconnectch := make(chan bool)
 	opts := nats.GetDefaultOptions()
-	opts.Url = "nats://localhost:22222"
+	opts.Url = "nats://127.0.0.1:22222"
 	opts.AllowReconnect = true
 	opts.MaxReconnect = 10000
 	opts.ReconnectWait = 100 * time.Millisecond
 
-	opts.DisconnectedCB = func(_ *nats.Conn) {
+	opts.DisconnectedErrCB = func(_ *nats.Conn, _ error) {
 		disconnectedch <- true
 	}
 	opts.ReconnectedCB = func(_ *nats.Conn) {
@@ -484,7 +500,7 @@ func TestFullFlushChanDuringReconnect(t *testing.T) {
 	reconnectch := make(chan bool)
 
 	opts := nats.GetDefaultOptions()
-	opts.Url = "nats://localhost:22222"
+	opts.Url = "nats://127.0.0.1:22222"
 	opts.AllowReconnect = true
 	opts.MaxReconnect = 10000
 	opts.ReconnectWait = 100 * time.Millisecond
@@ -576,6 +592,21 @@ func TestReconnectVerbose(t *testing.T) {
 	}
 }
 
+func TestReconnectBufSizeOption(t *testing.T) {
+	s := RunDefaultServer()
+	defer s.Shutdown()
+
+	nc, err := nats.Connect("nats://127.0.0.1:4222", nats.ReconnectBufSize(32))
+	if err != nil {
+		t.Fatalf("Should have connected ok: %v", err)
+	}
+	defer nc.Close()
+
+	if nc.Opts.ReconnectBufSize != 32 {
+		t.Fatalf("ReconnectBufSize should be 32 but it is %d", nc.Opts.ReconnectBufSize)
+	}
+}
+
 func TestReconnectBufSize(t *testing.T) {
 	s := RunDefaultServer()
 	defer s.Shutdown()
@@ -584,7 +615,7 @@ func TestReconnectBufSize(t *testing.T) {
 	o.ReconnectBufSize = 32 // 32 bytes
 
 	dch := make(chan bool)
-	o.DisconnectedCB = func(_ *nats.Conn) {
+	o.DisconnectedErrCB = func(_ *nats.Conn, _ error) {
 		dch <- true
 	}
 
@@ -603,7 +634,7 @@ func TestReconnectBufSize(t *testing.T) {
 	s.Shutdown()
 
 	if e := Wait(dch); e != nil {
-		t.Fatal("DisconnectedCB should have been triggered")
+		t.Fatal("DisconnectedErrCB should have been triggered")
 	}
 
 	msg := []byte("food") // 4 bytes paylaod, total proto is 16 bytes
@@ -620,4 +651,74 @@ func TestReconnectBufSize(t *testing.T) {
 		t.Fatalf("Expected to fail to publish message: got no error\n")
 	}
 	nc.Buffered()
+}
+
+// When a cluster is fronted by a single DNS name (desired) but communicates IPs to clients (also desired),
+// and we use TLS, we want to make sure we do the right thing connecting to an IP directly for TLS to work.
+// The reason this may happen is that the cluster has a single DNS name and a single certificate, but the cluster
+// wants to vend out IPs and not wait on DNS for topology changes and failover.
+func TestReconnectTLSHostNoIP(t *testing.T) {
+	sa, optsA := RunServerWithConfig("./configs/tls_noip_a.conf")
+	defer sa.Shutdown()
+	sb, optsB := RunServerWithConfig("./configs/tls_noip_b.conf")
+	defer sb.Shutdown()
+
+	// Wait for cluster to form.
+	wait := time.Now().Add(2 * time.Second)
+	for time.Now().Before(wait) {
+		sanr := sa.NumRoutes()
+		sbnr := sb.NumRoutes()
+		if sanr == 1 && sbnr == 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	endpoint := fmt.Sprintf("%s:%d", optsA.Host, optsA.Port)
+	secureURL := fmt.Sprintf("tls://%s:%s@%s/", optsA.Username, optsA.Password, endpoint)
+
+	dch := make(chan bool)
+	dcb := func(_ *nats.Conn, _ error) { dch <- true }
+	rch := make(chan bool)
+	rcb := func(_ *nats.Conn) { rch <- true }
+
+	nc, err := nats.Connect(secureURL,
+		nats.RootCAs("./configs/certs/ca.pem"),
+		nats.DisconnectErrHandler(dcb),
+		nats.ReconnectHandler(rcb))
+	if err != nil {
+		t.Fatalf("Failed to create secure (TLS) connection: %v", err)
+	}
+	defer nc.Close()
+
+	// Wait for DiscoveredServers() to be 1.
+	wait = time.Now().Add(2 * time.Second)
+	for time.Now().Before(wait) {
+		if len(nc.DiscoveredServers()) == 1 {
+			break
+		}
+	}
+	// Make sure this is the server B info, and that it is an IP.
+	expectedDiscoverURL := fmt.Sprintf("tls://%s:%d", optsB.Host, optsB.Port)
+	eurl, err := url.Parse(expectedDiscoverURL)
+	if err != nil {
+		t.Fatalf("Expected to parse discovered server URL: %v", err)
+	}
+	if addr := net.ParseIP(eurl.Hostname()); addr == nil {
+		t.Fatalf("Expected the discovered server to be an IP, got %v", eurl.Hostname())
+	}
+	ds := nc.DiscoveredServers()
+	if ds[0] != expectedDiscoverURL {
+		t.Fatalf("Expected %q, got %q", expectedDiscoverURL, ds[0])
+	}
+
+	// Force us to switch servers.
+	sa.Shutdown()
+
+	if e := Wait(dch); e != nil {
+		t.Fatal("DisconnectedErrCB should have been triggered")
+	}
+	if e := WaitTime(rch, time.Second); e != nil {
+		t.Fatalf("ReconnectedCB should have been triggered: %v", nc.LastError())
+	}
 }
