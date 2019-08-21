@@ -47,7 +47,7 @@ nc.Subscribe("foo", func(m *nats.Msg) {
 
 // Responding to a request message
 nc.Subscribe("request", func(m *nats.Msg) {
-    m.Respond([]byte("answer is 42")
+    m.Respond([]byte("answer is 42"))
 })
 
 // Simple Sync Subscriber
@@ -69,7 +69,7 @@ sub.Drain()
 msg, err := nc.Request("help", []byte("help me"), 10*time.Millisecond)
 
 // Replies
-nc.Subscribe("help", func(m *Msg) {
+nc.Subscribe("help", func(m *nats.Msg) {
     nc.Publish(m.Reply, []byte("I can help!"))
 })
 
@@ -116,12 +116,12 @@ c.Publish("hello", me)
 
 // Unsubscribe
 sub, err := c.Subscribe("foo", nil)
-...
+// ...
 sub.Unsubscribe()
 
 // Requests
 var response string
-err := c.Request("help", "help me", &response, 10*time.Millisecond)
+err = c.Request("help", "help me", &response, 10*time.Millisecond)
 if err != nil {
     fmt.Printf("Request failed: %v\n", err)
 }
@@ -141,7 +141,7 @@ This requires server with version >= 2.0.0
 NATS servers have a new security and authentication mechanism to authenticate with user credentials and Nkeys.
 The simplest form is to use the helper method UserCredentials(credsFilepath).
 ```go
-nc, err := nats.Connect(url, UserCredentials("user.creds"))
+nc, err := nats.Connect(url, nats.UserCredentials("user.creds"))
 ```
 
 The helper methods creates two callback handlers to present the user JWT and sign the nonce challenge from the server.
@@ -150,12 +150,12 @@ The helper will load and wipe and erase memory it uses for each connect or recon
 
 The helper also can take two entries, one for the JWT and one for the NKey seed file.
 ```go
-nc, err := nats.Connect(url, UserCredentials("user.jwt", "user.nk"))
+nc, err := nats.Connect(url, nats.UserCredentials("user.jwt", "user.nk"))
 ```
 
 You can also set the callback handlers directly and manage challenge signing directly.
 ```go
-nc, err := nats.Connect(url, UserJWT(jwtCB, sigCB))
+nc, err := nats.Connect(url, nats.UserJWT(jwtCB, sigCB))
 ```
 
 Bare Nkeys are also supported. The nkey seed should be in a read only file, e.g. seed.txt
@@ -174,7 +174,7 @@ opt, err := nats.NkeyOptionFromSeed("seed.txt")
 nc, err := nats.Connect(serverUrl, opt)
 
 // Direct
-nc, err := nats.Connect(serverUrl, Nkey(pubNkey, sigCB))
+nc, err := nats.Connect(serverUrl, nats.Nkey(pubNkey, sigCB))
 ```
 
 ## TLS
