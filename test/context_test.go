@@ -49,6 +49,16 @@ func testContextRequestWithTimeout(t *testing.T, nc *nats.Conn) {
 	nc.Subscribe("fast", func(m *nats.Msg) {
 		nc.Publish(m.Reply, []byte("OK"))
 	})
+	nc.Subscribe("hdrs", func(m *nats.Msg) {
+		if m.Header.Get("Hdr-Test") != "1" {
+			m.Respond([]byte("-ERR"))
+		}
+
+		r := nats.NewMsg(m.Reply)
+		r.Header = m.Header
+		r.Data = []byte("+OK")
+		m.RespondMsg(r)
+	})
 
 	ctx, cancelCB := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancelCB() // should always be called, not discarded, to prevent context leak
@@ -89,6 +99,20 @@ func testContextRequestWithTimeout(t *testing.T, nc *nats.Conn) {
 	_, err = nc.RequestWithContext(ctx, "fast", []byte("world"))
 	if err == nil {
 		t.Fatal("Expected request with context to fail")
+	}
+
+	// now test headers make it all the way back
+	msg := nats.NewMsg("hdrs")
+	msg.Header.Add("Hdr-Test", "1")
+	resp, err = nc.RequestMsgWithContext(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("Expected request to be published: %v", err)
+	}
+	if string(resp.Data) != "+OK" {
+		t.Fatalf("Headers were not published to the requestor")
+	}
+	if resp.Header.Get("Hdr-Test") != "1" {
+		t.Fatalf("Did not receive header in response")
 	}
 }
 
@@ -273,13 +297,15 @@ func TestContextOldRequestClosed(t *testing.T) {
 	errCh := make(chan error, 1)
 	start := time.Now()
 	go func() {
+		sub, _ := nc.SubscribeSync("checkClose")
+		defer sub.Unsubscribe()
 		_, err = nc.RequestWithContext(ctx, "checkClose", []byte("should be kicked out on close"))
 		errCh <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
 	nc.Close()
 	if e := <-errCh; e != nats.ErrConnectionClosed {
-		t.Fatalf("Unexpected error: %v", err)
+		t.Fatalf("Unexpected error: %v", e)
 	}
 	if dur := time.Since(start); dur >= time.Second {
 		t.Fatalf("Request took too long to bail out: %v", dur)

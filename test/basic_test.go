@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2012-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,6 +15,7 @@ package test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"math"
 	"regexp"
@@ -119,18 +120,35 @@ func TestConnectedServer(t *testing.T) {
 	if u == "" || u != nats.DefaultURL {
 		t.Fatalf("Unexpected connected URL of %s\n", u)
 	}
-	srv := nc.ConnectedServerId()
-	if srv == "" {
-		t.Fatal("Expected a connected server id")
+	id := nc.ConnectedServerId()
+	if id == "" {
+		t.Fatalf("Expected a connected server id, got %s", id)
 	}
+	name := nc.ConnectedServerName()
+	if name == "" {
+		t.Fatalf("Expected a connected server name, got %s", name)
+	}
+	cname := nc.ConnectedClusterName()
+	if cname == "" {
+		t.Fatalf("Expected a connected server cluster name, got %s", cname)
+	}
+
 	nc.Close()
 	u = nc.ConnectedUrl()
 	if u != "" {
 		t.Fatalf("Expected a nil connected URL, got %s\n", u)
 	}
-	srv = nc.ConnectedServerId()
-	if srv != "" {
-		t.Fatalf("Expected a nil connect server, got %s\n", srv)
+	id = nc.ConnectedServerId()
+	if id != "" {
+		t.Fatalf("Expected a nil connect server, got %s", id)
+	}
+	name = nc.ConnectedServerName()
+	if name != "" {
+		t.Fatalf("Expected a nil connect server name, got %s", name)
+	}
+	cname = nc.ConnectedClusterName()
+	if cname != "" {
+		t.Fatalf("Expected a nil connect server cluster, got %s", cname)
 	}
 }
 
@@ -194,6 +212,9 @@ func TestPublishDoesNotFailOnSlowConsumer(t *testing.T) {
 	defer s.Shutdown()
 	nc := NewDefaultConnection(t)
 	defer nc.Close()
+
+	// Override default handler for test.
+	nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, _ error) {})
 
 	sub, err := nc.SubscribeSync("foo")
 	if err != nil {
@@ -555,8 +576,51 @@ func TestRequestTimeout(t *testing.T) {
 	nc := NewDefaultConnection(t)
 	defer nc.Close()
 
+	// We now need a responder by default otherwise we will get a no responders error.
+	nc.SubscribeSync("foo")
+
 	if _, err := nc.Request("foo", []byte("help"), 10*time.Millisecond); err != nats.ErrTimeout {
 		t.Fatalf("Expected to receive a timeout error")
+	}
+}
+
+func TestBasicNoRespondersSupport(t *testing.T) {
+	s := RunServerOnPort(-1)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Error connecting to server: %v", err)
+	}
+	defer nc.Close()
+
+	// Normal new style
+	if m, err := nc.Request("foo", nil, time.Second); err != nats.ErrNoResponders {
+		t.Fatalf("Expected a no responders error and nil msg, got m:%+v and err: %v", m, err)
+	}
+	// New style with context
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if m, err := nc.RequestWithContext(ctx, "foo", nil); err != nats.ErrNoResponders {
+		t.Fatalf("Expected a no responders error and nil msg, got m:%+v and err: %v", m, err)
+	}
+
+	// Now do old request style as well.
+	nc, err = nats.Connect(s.ClientURL(), nats.UseOldRequestStyle())
+	if err != nil {
+		t.Fatalf("Error connecting to server: %v", err)
+	}
+	defer nc.Close()
+
+	// Normal old request style
+	if m, err := nc.Request("foo", nil, time.Second); err != nats.ErrNoResponders {
+		t.Fatalf("Expected a no responders error and nil msg, got m:%+v and err: %v", m, err)
+	}
+	// Old request style with context
+	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if m, err := nc.RequestWithContext(ctx, "foo", nil); err != nats.ErrNoResponders {
+		t.Fatalf("Expected a no responders error and nil msg, got m:%+v and err: %v", m, err)
 	}
 }
 
@@ -586,13 +650,15 @@ func TestOldRequest(t *testing.T) {
 	errCh := make(chan error, 1)
 	start := time.Now()
 	go func() {
+		sub, _ := nc.SubscribeSync("checkClose")
+		defer sub.Unsubscribe()
 		_, err := nc.Request("checkClose", []byte("should be kicked out on close"), time.Second)
 		errCh <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
 	nc.Close()
 	if e := <-errCh; e != nats.ErrConnectionClosed {
-		t.Fatalf("Unexpected error: %v", err)
+		t.Fatalf("Unexpected error: %v", e)
 	}
 	if dur := time.Since(start); dur >= time.Second {
 		t.Fatalf("Request took too long to bail out: %v", dur)
@@ -677,6 +743,7 @@ func TestRequestClose(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 		nc.Close()
 	}()
+	nc.SubscribeSync("foo")
 	if _, err := nc.Request("foo", []byte("help"), 2*time.Second); err != nats.ErrInvalidConnection && err != nats.ErrConnectionClosed {
 		t.Fatalf("Expected connection error: got %v", err)
 	}
@@ -822,6 +889,7 @@ func TestOptions(t *testing.T) {
 		nats.Name("myName"),
 		nats.MaxReconnects(2),
 		nats.ReconnectWait(50*time.Millisecond),
+		nats.ReconnectJitter(0, 0),
 		nats.PingInterval(20*time.Millisecond))
 	if err != nil {
 		t.Fatalf("Failed to connect: %v", err)

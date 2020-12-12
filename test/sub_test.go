@@ -1,4 +1,4 @@
-// Copyright 2013-2019 The NATS Authors
+// Copyright 2013-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -144,6 +144,7 @@ func TestAutoUnsubAndReconnect(t *testing.T) {
 
 	nc, err := nats.Connect(nats.DefaultURL,
 		nats.ReconnectWait(50*time.Millisecond),
+		nats.ReconnectJitter(0, 0),
 		nats.ReconnectHandler(func(_ *nats.Conn) { rch <- true }))
 	if err != nil {
 		t.Fatalf("Unable to connect: %v", err)
@@ -201,6 +202,7 @@ func TestAutoUnsubWithParallelNextMsgCalls(t *testing.T) {
 
 	nc, err := nats.Connect(nats.DefaultURL,
 		nats.ReconnectWait(50*time.Millisecond),
+		nats.ReconnectJitter(0, 0),
 		nats.ReconnectHandler(func(_ *nats.Conn) { rch <- true }))
 	if err != nil {
 		t.Fatalf("Unable to connect: %v", err)
@@ -415,6 +417,9 @@ func TestSlowSubscriber(t *testing.T) {
 	nc := NewDefaultConnection(t)
 	defer nc.Close()
 
+	// Override default handler for test.
+	nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, _ error) {})
+
 	sub, _ := nc.SubscribeSync("foo")
 	sub.SetPendingLimits(100, 1024)
 
@@ -442,6 +447,9 @@ func TestSlowChanSubscriber(t *testing.T) {
 	nc := NewDefaultConnection(t)
 	defer nc.Close()
 
+	// Override default handler for test.
+	nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, _ error) {})
+
 	ch := make(chan *nats.Msg, 64)
 	sub, _ := nc.ChanSubscribe("foo", ch)
 	sub.SetPendingLimits(100, 1024)
@@ -464,6 +472,9 @@ func TestSlowAsyncSubscriber(t *testing.T) {
 
 	nc := NewDefaultConnection(t)
 	defer nc.Close()
+
+	// Override default handler for test.
+	nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, _ error) {})
 
 	bch := make(chan bool)
 
@@ -893,7 +904,8 @@ func TestChanSubscriberPendingLimits(t *testing.T) {
 	// There was a defect that prevented to receive more than
 	// the default pending message limit. Trying to send more
 	// than this limit.
-	total := nats.DefaultSubPendingMsgsLimit + 100
+	pending := 1000
+	total := pending + 100
 
 	for typeSubs := 0; typeSubs < 3; typeSubs++ {
 
@@ -906,10 +918,19 @@ func TestChanSubscriberPendingLimits(t *testing.T) {
 			switch typeSubs {
 			case 0:
 				sub, err = nc.ChanSubscribe("foo", ch)
+				if err := sub.SetPendingLimits(pending, -1); err == nil {
+					t.Fatalf("Expected an error setting pending limits")
+				}
 			case 1:
 				sub, err = nc.ChanQueueSubscribe("foo", "bar", ch)
+				if err := sub.SetPendingLimits(pending, -1); err == nil {
+					t.Fatalf("Expected an error setting pending limits")
+				}
 			case 2:
 				sub, err = nc.QueueSubscribeSyncWithChan("foo", "bar", ch)
+				if err := sub.SetPendingLimits(pending, -1); err == nil {
+					t.Fatalf("Expected an error setting pending limits")
+				}
 			}
 			if err != nil {
 				t.Fatalf("Unexpected error on subscribe: %v", err)
@@ -1017,6 +1038,9 @@ func TestUnsubscribeChanOnSubscriber(t *testing.T) {
 
 	nc := NewDefaultConnection(t)
 	defer nc.Close()
+
+	// Override default handler for test.
+	nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, _ error) {})
 
 	// Create our own channel.
 	ch := make(chan *nats.Msg, 8)
@@ -1170,17 +1194,19 @@ func TestAsyncSubscriptionPendingDrain(t *testing.T) {
 	nc.Flush()
 
 	// Wait for all delivered.
-	for d, _ := sub.Delivered(); d != int64(total); d, _ = sub.Delivered() {
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	m, b, _ := sub.Pending()
-	if m != 0 {
-		t.Fatalf("Expected msgs of 0, got %d", m)
-	}
-	if b != 0 {
-		t.Fatalf("Expected bytes of 0, got %d", b)
-	}
+	waitFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		if d, _ := sub.Delivered(); d != int64(total) {
+			return fmt.Errorf("Wrong delivered count: %v vs %v", d, total)
+		}
+		m, b, _ := sub.Pending()
+		if m != 0 {
+			return fmt.Errorf("Expected msgs of 0, got %d", m)
+		}
+		if b != 0 {
+			return fmt.Errorf("Expected bytes of 0, got %d", b)
+		}
+		return nil
+	})
 
 	sub.Unsubscribe()
 	if _, err := sub.Delivered(); err == nil {
@@ -1280,6 +1306,9 @@ func TestSetPendingLimits(t *testing.T) {
 
 	nc := NewDefaultConnection(t)
 	defer nc.Close()
+
+	// Override default handler for test.
+	nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, _ error) {})
 
 	payload := []byte("hello")
 	payloadLen := len(payload)

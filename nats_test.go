@@ -1,4 +1,4 @@
-// Copyright 2012-2019 The NATS Authors
+// Copyright 2012-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -30,13 +30,13 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/nats-io/jwt"
 	"github.com/nats-io/nats-server/v2/server"
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nkeys"
@@ -1007,7 +1007,6 @@ func TestAsyncINFO(t *testing.T) {
 		ID:           "test",
 		Host:         "localhost",
 		Port:         4222,
-		Version:      "1.2.3",
 		AuthRequired: true,
 		TLSRequired:  true,
 		MaxPayload:   2 * 1024 * 1024,
@@ -1118,28 +1117,32 @@ func TestAsyncINFO(t *testing.T) {
 	for _, srv := range c.srvPool {
 		urlsAfterPoolSetup = append(urlsAfterPoolSetup, srv.url.Host)
 	}
-	checkPoolOrderDidNotChange := func() {
+	checkNewURLsAddedRandomly := func() {
+		t.Helper()
+		var ok bool
 		for i := 0; i < len(urlsAfterPoolSetup); i++ {
 			if c.srvPool[i].url.Host != urlsAfterPoolSetup[i] {
-				stackFatalf(t, "Pool should have %q at index %q, has %q", urlsAfterPoolSetup[i], i, c.srvPool[i].url.Host)
+				ok = true
+				break
 			}
+		}
+		if !ok {
+			t.Fatalf("New URLs were not added randmonly: %q", c.Servers())
 		}
 	}
 	// Add new urls
-	newURLs := []string{
-		"localhost:6222",
-		"localhost:7222",
-		"localhost:8222\", \"localhost:9222",
-		"localhost:10222\", \"localhost:11222\", \"localhost:12222,",
+	newURLs := "\"impA:4222\", \"impB:4222\", \"impC:4222\", " +
+		"\"impD:4222\", \"impE:4222\", \"impF:4222\", \"impG:4222\", " +
+		"\"impH:4222\", \"impI:4222\", \"impJ:4222\""
+	info = []byte("INFO {\"connect_urls\":[" + newURLs + "]}\r\n")
+	err = c.parse(info)
+	if err != nil || c.ps.state != OP_START {
+		t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
 	}
-	for _, newURL := range newURLs {
-		info = []byte("INFO {\"connect_urls\":[\"" + newURL + "]}\r\n")
-		err = c.parse(info)
-		if err != nil || c.ps.state != OP_START {
-			t.Fatalf("Unexpected: %d : %v\n", c.ps.state, err)
-		}
-		// Check that pool order does not change up to the new addition(s).
-		checkPoolOrderDidNotChange()
+	checkNewURLsAddedRandomly()
+	// Check that we have not moved the first URL
+	if u := c.srvPool[0].url.Host; u != urlsAfterPoolSetup[0] {
+		t.Fatalf("Expected first URL to be %q, got %q", urlsAfterPoolSetup[0], u)
 	}
 }
 
@@ -1433,13 +1436,6 @@ func TestUserCredentialsChainedFile(t *testing.T) {
 	nc.Close()
 }
 
-func createNewUserKeys() (string, []byte) {
-	kp, _ := nkeys.CreateUser()
-	pub, _ := kp.PublicKey()
-	priv, _ := kp.Seed()
-	return pub, priv
-}
-
 func TestExpiredUserCredentials(t *testing.T) {
 	// The goal of this test was to check how a client with an expiring JWT
 	// behaves. It should receive an async -ERR indicating that the auth
@@ -1502,6 +1498,7 @@ func TestExpiredUserCredentials(t *testing.T) {
 	url := fmt.Sprintf("nats://127.0.0.1:%d", addr.Port)
 	nc, err := Connect(url,
 		ReconnectWait(25*time.Millisecond),
+		ReconnectJitter(0, 0),
 		MaxReconnects(-1),
 		ErrorHandler(func(_ *Conn, _ *Subscription, e error) {
 			select {
@@ -1552,79 +1549,6 @@ func TestExpiredUserCredentials(t *testing.T) {
 	// Close the listener and wait for go routine to end.
 	l.Close()
 	wg.Wait()
-}
-
-func TestExpiredUserCredentialsRenewal(t *testing.T) {
-	if server.VERSION[0] == '1' {
-		t.Skip()
-	}
-	ts := runTrustServer()
-	defer ts.Shutdown()
-
-	// Create user credentials that will expire in a short timeframe.
-	pub, priv := createNewUserKeys()
-	nuc := jwt.NewUserClaims(pub)
-	nuc.Expires = time.Now().Add(time.Second).Unix()
-	akp, _ := nkeys.FromSeed(aSeed)
-	ujwt, err := nuc.Encode(akp)
-	if err != nil {
-		t.Fatalf("Error encoding user jwt: %v", err)
-	}
-	creds, err := jwt.FormatUserConfig(ujwt, priv)
-	if err != nil {
-		t.Fatalf("Error encoding credentials: %v", err)
-	}
-	chainedFile := createTmpFile(t, creds)
-	defer os.Remove(chainedFile)
-
-	rch := make(chan bool)
-
-	url := fmt.Sprintf("nats://127.0.0.1:%d", TEST_PORT)
-	nc, err := Connect(url,
-		UserCredentials(chainedFile),
-		ReconnectWait(25*time.Millisecond),
-		MaxReconnects(2),
-		ReconnectHandler(func(nc *Conn) {
-			rch <- true
-		}),
-	)
-	if err != nil {
-		t.Fatalf("Expected to connect, got %v", err)
-	}
-	defer nc.Close()
-
-	// Place new credentials underneath.
-	nuc.Expires = time.Now().Add(30 * time.Second).Unix()
-	ujwt, err = nuc.Encode(akp)
-	if err != nil {
-		t.Fatalf("Error encoding user jwt: %v", err)
-	}
-	creds, err = jwt.FormatUserConfig(ujwt, priv)
-	if err != nil {
-		t.Fatalf("Error encoding credentials: %v", err)
-	}
-	if err := ioutil.WriteFile(chainedFile, creds, 0666); err != nil {
-		t.Fatalf("Error writing conf file: %v", err)
-	}
-
-	// Make sure we get disconnected and reconnected first.
-	if err := WaitTime(rch, 2*time.Second); err != nil {
-		t.Fatal("Should have reconnected.")
-	}
-
-	// We should not have been closed.
-	if nc.IsClosed() {
-		t.Fatal("Got disconnected when we should have reconnected.")
-	}
-
-	// Check that we clear the lastErr that can cause the disconnect.
-	// Our reconnect CB will happen before the clear. So check after a bit.
-	time.Sleep(50 * time.Millisecond)
-	nc.mu.Lock()
-	defer nc.mu.Unlock()
-	if nc.current.lastErr != nil {
-		t.Fatalf("Expected lastErr to be cleared, got %q", nc.current.lastErr)
-	}
 }
 
 // If we are using TLS and have multiple servers we try to match the IP
@@ -1817,7 +1741,7 @@ func TestNKeyOptionFromSeed(t *testing.T) {
 
 		// Read connect and ping commands sent from the client
 		br := bufio.NewReaderSize(conn, 10*1024)
-		line, _, _ := br.ReadLine()
+		line, _, err := br.ReadLine()
 		if err != nil {
 			errCh <- fmt.Errorf("expected CONNECT and PING from client, got: %s", err)
 			return
@@ -2075,8 +1999,10 @@ func TestAuthErrorOnReconnect(t *testing.T) {
 	urls := fmt.Sprintf("nats://%s:%d, nats://%s:%d", o1.Host, o1.Port, o2.Host, o2.Port)
 	nc, err := Connect(urls,
 		ReconnectWait(25*time.Millisecond),
+		ReconnectJitter(0, 0),
 		MaxReconnects(-1),
 		DontRandomize(),
+		ErrorHandler(func(_ *Conn, _ *Subscription, _ error) {}),
 		DisconnectErrHandler(func(_ *Conn, e error) {
 			dch <- true
 		}),
@@ -2269,7 +2195,7 @@ func TestGetRTT(t *testing.T) {
 	s := RunServerOnPort(-1)
 	defer s.Shutdown()
 
-	nc, err := Connect(s.ClientURL(), ReconnectWait(10*time.Millisecond))
+	nc, err := Connect(s.ClientURL(), ReconnectWait(10*time.Millisecond), ReconnectJitter(0, 0))
 	if err != nil {
 		t.Fatalf("Expected to connect to server, got %v", err)
 	}
@@ -2388,4 +2314,288 @@ func TestNoPanicOnSrvPoolSizeChanging(t *testing.T) {
 		l.Close()
 	}
 	wg.Wait()
+}
+
+func TestReconnectWaitJitter(t *testing.T) {
+	s := RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+
+	rch := make(chan time.Time, 1)
+	nc, err := Connect(s.ClientURL(),
+		ReconnectWait(100*time.Millisecond),
+		ReconnectJitter(500*time.Millisecond, 0),
+		ReconnectHandler(func(_ *Conn) {
+			rch <- time.Now()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Error during connect: %v", err)
+	}
+	defer nc.Close()
+
+	s.Shutdown()
+	start := time.Now()
+	// Wait a bit so that the library tries a first time without waiting.
+	time.Sleep(50 * time.Millisecond)
+	s = RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+	select {
+	case end := <-rch:
+		dur := end.Sub(start)
+		// We should wait at least the reconnect wait + random up to 500ms.
+		// Account for a bit of variation since we rely on the reconnect
+		// handler which is not invoked in place.
+		if dur < 90*time.Millisecond || dur > 800*time.Millisecond {
+			t.Fatalf("Wrong wait: %v", dur)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Should have reconnected")
+	}
+	nc.Close()
+
+	// Use a long reconnect wait
+	nc, err = Connect(s.ClientURL(), ReconnectWait(10*time.Minute))
+	if err != nil {
+		t.Fatalf("Error during connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Cause a disconnect
+	s.Shutdown()
+	// Wait a bit for the reconnect loop to go into wait mode.
+	time.Sleep(50 * time.Millisecond)
+	s = RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+	// Now close and expect the reconnect go routine to return..
+	nc.Close()
+	// Wait a bit to give a chance for the go routine to exit.
+	time.Sleep(50 * time.Millisecond)
+	buf := make([]byte, 100000)
+	n := runtime.Stack(buf, true)
+	if strings.Contains(string(buf[:n]), "doReconnect") {
+		t.Fatalf("doReconnect go routine still running:\n%s", buf[:n])
+	}
+}
+
+func TestCustomReconnectDelay(t *testing.T) {
+	s := RunServerOnPort(TEST_PORT)
+	defer s.Shutdown()
+
+	expectedAttempt := 1
+	errCh := make(chan error, 1)
+	cCh := make(chan bool, 1)
+	nc, err := Connect(s.ClientURL(),
+		CustomReconnectDelay(func(n int) time.Duration {
+			var err error
+			var delay time.Duration
+			if n != expectedAttempt {
+				err = fmt.Errorf("Expected attempt to be %v, got %v", expectedAttempt, n)
+			} else {
+				expectedAttempt++
+				if n <= 4 {
+					delay = 100 * time.Millisecond
+				}
+			}
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
+			return delay
+		}),
+		MaxReconnects(4),
+		ClosedHandler(func(_ *Conn) {
+			cCh <- true
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Error during connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Cause disconnect
+	s.Shutdown()
+
+	// We should be trying to reconnect 4 times
+	start := time.Now()
+
+	// Wait on error or completion of test.
+	select {
+	case e := <-errCh:
+		if e != nil {
+			t.Fatal(e.Error())
+		}
+	case <-cCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("No CB invoked")
+	}
+	if dur := time.Since(start); dur >= 500*time.Millisecond {
+		t.Fatalf("Waited too long on each reconnect: %v", dur)
+	}
+}
+
+func TestHeaderParser(t *testing.T) {
+	shouldErr := func(hdr string) {
+		t.Helper()
+		if _, err := decodeHeadersMsg([]byte(hdr)); err == nil {
+			t.Fatalf("Expected an error")
+		}
+	}
+	shouldErr("NATS/1.0")
+	shouldErr("NATS/1.0\r\n")
+	shouldErr("NATS/1.0\r\nk1:v1")
+	shouldErr("NATS/1.0\r\nk1:v1\r\n")
+
+	// Check that we can do inline status and descriptions
+	checkStatus := func(hdr string, status int, description string) {
+		t.Helper()
+		hdrs, err := decodeHeadersMsg([]byte(hdr + "\r\n\r\n"))
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if code, err := strconv.Atoi(hdrs.Get(statusHdr)); err != nil || code != status {
+			t.Fatalf("Expected status of %d, got %s", status, hdrs.Get(statusHdr))
+		}
+		if len(description) > 0 {
+			if descr := hdrs.Get(descrHdr); err != nil || descr != description {
+				t.Fatalf("Expected description of %q, got %q", description, descr)
+			}
+		}
+	}
+
+	checkStatus("NATS/1.0 503", 503, "")
+	checkStatus("NATS/1.0 503 No Responders", 503, "No Responders")
+	checkStatus("NATS/1.0  404   No Messages", 404, "No Messages")
+}
+
+func TestLameDuckMode(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Could not listen on an ephemeral port: %v", err)
+	}
+	tl := l.(*net.TCPListener)
+	defer tl.Close()
+
+	addr := tl.Addr().(*net.TCPAddr)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ldmInfos := []string{"INFO {\"ldm\":true}\r\n", "INFO {\"connect_urls\":[\"127.0.0.1:1234\"],\"ldm\":true}\r\n"}
+		for _, ldmInfo := range ldmInfos {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			info := "INFO {\"server_id\":\"foobar\"}\r\n"
+			conn.Write([]byte(info))
+
+			// Read connect and ping commands sent from the client
+			br := bufio.NewReaderSize(conn, 10*1024)
+			br.ReadLine()
+			br.ReadLine()
+			conn.Write([]byte(pongProto))
+
+			// Wait a bit and then send a INFO with LDM
+			time.Sleep(100 * time.Millisecond)
+			conn.Write([]byte(ldmInfo))
+			br.ReadLine()
+			conn.Close()
+		}
+	}()
+
+	url := fmt.Sprintf("nats://127.0.0.1:%d", addr.Port)
+	time.Sleep(100 * time.Millisecond)
+
+	for _, test := range []struct {
+		name  string
+		curls bool
+	}{
+		{"without connect urls", false},
+		{"with connect urls", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ch := make(chan bool, 1)
+			errCh := make(chan error, 1)
+			nc, err := Connect(url,
+				DiscoveredServersHandler(func(nc *Conn) {
+					ds := nc.DiscoveredServers()
+					if !reflect.DeepEqual(ds, []string{"nats://127.0.0.1:1234"}) {
+						errCh <- fmt.Errorf("wrong discovered servers: %q", ds)
+					} else {
+						errCh <- nil
+					}
+				}),
+				LameDuckModeHandler(func(_ *Conn) {
+					ch <- true
+				}),
+			)
+			if err != nil {
+				t.Fatalf("Expected to connect, got %v", err)
+			}
+			defer nc.Close()
+
+			select {
+			case <-ch:
+			case <-time.After(2 * time.Second):
+				t.Fatal("should have been notified of LDM")
+			}
+			select {
+			case e := <-errCh:
+				if !test.curls {
+					t.Fatal("should not have received connect urls")
+				} else if e != nil {
+					t.Fatal(e.Error())
+				}
+			default:
+				if test.curls {
+					t.Fatal("should have received notification about discovered servers")
+				}
+			}
+
+			nc.Close()
+		})
+	}
+	wg.Wait()
+}
+
+func TestMsg_RespondMsg(t *testing.T) {
+	s := RunServerOnPort(-1)
+	defer s.Shutdown()
+
+	nc, err := Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Expected to connect to server, got %v", err)
+	}
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync(NewInbox())
+	if err != nil {
+		t.Fatalf("subscribe failed: %s", err)
+	}
+
+	nc.PublishMsg(&Msg{Reply: sub.Subject, Subject: sub.Subject, Data: []byte("request")})
+	req, err := sub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("NextMsg failed: %s", err)
+	}
+
+	// verifies that RespondMsg sets the reply subject on msg based on req
+	err = req.RespondMsg(&Msg{Data: []byte("response")})
+	if err != nil {
+		t.Fatalf("RespondMsg failed: %s", err)
+	}
+
+	resp, err := sub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("NextMsg failed: %s", err)
+	}
+
+	if !bytes.Equal(resp.Data, []byte("response")) {
+		t.Fatalf("did not get correct response: %q", resp.Data)
+	}
 }
