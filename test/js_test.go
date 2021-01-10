@@ -834,6 +834,53 @@ func TestJetStreamAutoMaxAckPending(t *testing.T) {
 	}
 }
 
+func TestJetStreamInterfaces(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer nc.Close()
+
+	var js nats.JetStream
+	var jsm nats.JetStreamManager
+	var jsctx nats.JetStreamContext
+
+	// JetStream that can publish/subscribe but cannot manage streams.
+	js, err = nc.JetStream()
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	js.Publish("foo", []byte("hello"))
+
+	// JetStream context that can manage streams/consumers but cannot produce messages.
+	jsm, err = nc.JetStream()
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	jsm.AddStream(&nats.StreamConfig{Name: "FOO"})
+
+	// JetStream context that can both manage streams/consumers
+	// as well as publish/subscribe.
+	jsctx, err = nc.JetStream()
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	jsctx.AddStream(&nats.StreamConfig{Name: "BAR"})
+	jsctx.Publish("bar", []byte("hello world"))
+
+	publishMsg := func(js nats.JetStream, payload []byte) {
+		js.Publish("foo", payload)
+	}
+	publishMsg(js, []byte("hello world"))
+}
+
 // WIP(dlc) - This is in support of stall based tests and processing.
 func TestJetStreamPullBasedStall(t *testing.T) {
 	t.SkipNow()
@@ -911,5 +958,91 @@ func TestJetStreamPullBasedStall(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("Timeout waiting for messages, last received was %d", received)
 		}
+	}
+}
+
+func TestJetStreamSubscribe_DeliverPolicy(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Create the stream using our client API.
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var publishTime time.Time
+
+	for i := 0; i < 10; i++ {
+		payload := fmt.Sprintf("i:%d", i)
+		if i == 5 {
+			publishTime = time.Now()
+		}
+		js.Publish("foo", []byte(payload))
+	}
+
+	for _, test := range []struct {
+		name     string
+		subopt   nats.SubOpt
+		expected int
+	}{
+		{
+			"deliver.all", nats.DeliverAll(), 10,
+		},
+		{
+			"deliver.last", nats.DeliverLast(), 1,
+		},
+		{
+			"deliver.new", nats.DeliverNew(), 0,
+		},
+		{
+			"deliver.starttime", nats.StartTime(publishTime), 5,
+		},
+		{
+			"deliver.startseq", nats.StartSequence(6), 5,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			got := 0
+			sub, err := js.Subscribe("foo", func(m *nats.Msg) {
+				got++
+				if got == test.expected {
+					cancel()
+				}
+			}, test.subopt)
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			<-ctx.Done()
+			sub.Drain()
+
+			if got != test.expected {
+				t.Fatalf("Expected %d, got %d", test.expected, got)
+			}
+		})
 	}
 }
