@@ -22,75 +22,95 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+)
+
+// Request API subjects for JetStream.
+const (
+	// defaultAPIPrefix is the default prefix for the JetStream API.
+	defaultAPIPrefix = "$JS.API."
+
+	// apiAccountInfo is for obtaining general information about JetStream.
+	apiAccountInfo = "INFO"
+
+	// apiConsumerCreateT is used to create consumers.
+	apiConsumerCreateT = "CONSUMER.CREATE.%s"
+
+	// apiDurableCreateT is used to create durable consumers.
+	apiDurableCreateT = "CONSUMER.DURABLE.CREATE.%s.%s"
+
+	// apiConsumerInfoT is used to create consumers.
+	apiConsumerInfoT = "CONSUMER.INFO.%s.%s"
+
+	// apiRequestNextT is the prefix for the request next message(s) for a consumer in worker/pull mode.
+	apiRequestNextT = "CONSUMER.MSG.NEXT.%s.%s"
+
+	// apiDeleteConsumerT is used to delete consumers.
+	apiConsumerDeleteT = "CONSUMER.DELETE.%s.%s"
+
+	// apiConsumerListT is used to return all detailed consumer information
+	apiConsumerListT = "CONSUMER.LIST.%s"
+
+	// apiStreams can lookup a stream by subject.
+	apiStreams = "STREAM.NAMES"
+
+	// apiStreamCreateT is the endpoint to create new streams.
+	apiStreamCreateT = "STREAM.CREATE.%s"
+
+	// apiStreamInfoT is the endpoint to get information on a stream.
+	apiStreamInfoT = "STREAM.INFO.%s"
+
+	// apiStreamUpdate is the endpoint to update existing streams.
+	apiStreamUpdateT = "STREAM.UPDATE.%s"
+
+	// apiStreamDeleteT is the endpoint to delete streams.
+	apiStreamDeleteT = "STREAM.DELETE.%s"
+
+	// apiPurgeStreamT is the endpoint to purge streams.
+	apiStreamPurgeT = "STREAM.PURGE.%s"
+
+	// apiStreamListT is the endpoint that will return all detailed stream information
+	apiStreamList = "STREAM.LIST"
+
+	// apiMsgGetT is the endpoint to get a message.
+	apiMsgGetT = "STREAM.MSG.GET.%s"
+
+	// apiMsgDeleteT is the endpoint to remove a message.
+	apiMsgDeleteT = "STREAM.MSG.DELETE.%s"
 )
 
 // JetStream is the public interface for JetStream.
 type JetStream interface {
-	// Publishing messages to JetStream.
+	// Publish publishes a message to JetStream.
 	Publish(subj string, data []byte, opts ...PubOpt) (*PubAck, error)
+
+	// Publish publishes a Msg to JetStream.
 	PublishMsg(m *Msg, opts ...PubOpt) (*PubAck, error)
 
-	// Subscribing to messages in JetStream.
+	// Subscribe creates an async Subscription for JetStream.
 	Subscribe(subj string, cb MsgHandler, opts ...SubOpt) (*Subscription, error)
+
+	// SubscribeSync creates a Subscription that can be used to process messages synchronously.
 	SubscribeSync(subj string, opts ...SubOpt) (*Subscription, error)
 
-	// Channel versions.
+	// ChanSubscribe creates channel based Subscription.
 	ChanSubscribe(subj string, ch chan *Msg, opts ...SubOpt) (*Subscription, error)
-	// QueueSubscribe.
+
+	// QueueSubscribe creates a Subscription with a queue group.
 	QueueSubscribe(subj, queue string, cb MsgHandler, opts ...SubOpt) (*Subscription, error)
+
+	// QueueSubscribeSync creates a Subscription with a queue group that can be used to process messages synchronously.
+	QueueSubscribeSync(subj, queue string, opts ...SubOpt) (*Subscription, error)
 }
 
-// JetStreamManager is the public interface for managing JetStream streams & consumers.
-type JetStreamManager interface {
-	// Create a stream.
-	AddStream(cfg *StreamConfig) (*StreamInfo, error)
-	// Create a consumer.
-	AddConsumer(stream string, cfg *ConsumerConfig) (*ConsumerInfo, error)
-	// Stream information.
-	StreamInfo(stream string) (*StreamInfo, error)
-}
-
-// JetStream is the public interface for the JetStream context.
+// JetStreamContext is the public interface for JetStream.
 type JetStreamContext interface {
 	JetStream
 	JetStreamManager
 }
 
-// APIError is included in all API responses if there was an error.
-type APIError struct {
-	Code        int    `json:"code"`
-	Description string `json:"description,omitempty"`
-}
-
-// APIResponse is a standard response from the JetStream JSON API
-type APIResponse struct {
-	Type  string    `json:"type"`
-	Error *APIError `json:"error,omitempty"`
-}
-
-type AccountInfoResponse struct {
-	APIResponse
-	*AccountStats
-}
-
-// AccountLimits is for the information about
-type AccountLimits struct {
-	MaxMemory    int64 `json:"max_memory"`
-	MaxStore     int64 `json:"max_storage"`
-	MaxStreams   int   `json:"max_streams"`
-	MaxConsumers int   `json:"max_consumers"`
-}
-
-// AccountStats returns current statistics about the account's JetStream usage.
-type AccountStats struct {
-	Memory  uint64        `json:"memory"`
-	Store   uint64        `json:"storage"`
-	Streams int           `json:"streams"`
-	Limits  AccountLimits `json:"limits"`
-}
-
-// Internal struct for jetstream
+// js is an internal struct from a JetStreamContext.
 type js struct {
 	nc *Conn
 	// For importing JetStream from other accounts.
@@ -101,32 +121,11 @@ type js struct {
 	direct bool
 }
 
-// Request API subjects for JetStream.
-const (
-	JSDefaultAPIPrefix = "$JS.API."
-	// JSApiAccountInfo is for obtaining general information about JetStream.
-	JSApiAccountInfo = "INFO"
-	// JSApiStreams can lookup a stream by subject.
-	JSApiStreams = "STREAM.NAMES"
-	// JSApiConsumerCreateT is used to create consumers.
-	JSApiConsumerCreateT = "CONSUMER.CREATE.%s"
-	// JSApiDurableCreateT is used to create durable consumers.
-	JSApiDurableCreateT = "CONSUMER.DURABLE.CREATE.%s.%s"
-	// JSApiConsumerInfoT is used to create consumers.
-	JSApiConsumerInfoT = "CONSUMER.INFO.%s.%s"
-	// JSApiRequestNextT is the prefix for the request next message(s) for a consumer in worker/pull mode.
-	JSApiRequestNextT = "CONSUMER.MSG.NEXT.%s.%s"
-	// JSApiStreamCreateT is the endpoint to create new streams.
-	JSApiStreamCreateT = "STREAM.CREATE.%s"
-	// JSApiStreamInfoT is the endpoint to get information on a stream.
-	JSApiStreamInfoT = "STREAM.INFO.%s"
-)
+const defaultRequestWait = 5 * time.Second
 
 // JetStream returns a JetStream context for pub/sub interactions.
 func (nc *Conn) JetStream(opts ...JSOpt) (JetStreamContext, error) {
-	const defaultRequestWait = 5 * time.Second
-
-	js := &js{nc: nc, pre: JSDefaultAPIPrefix, wait: defaultRequestWait}
+	js := &js{nc: nc, pre: defaultAPIPrefix, wait: defaultRequestWait}
 
 	for _, opt := range opts {
 		if err := opt.configureJSContext(js); err != nil {
@@ -138,20 +137,13 @@ func (nc *Conn) JetStream(opts ...JSOpt) (JetStreamContext, error) {
 		return js, nil
 	}
 
-	resp, err := nc.Request(js.apiSubj(JSApiAccountInfo), nil, js.wait)
-	if err != nil {
+	if _, err := js.AccountInfo(); err != nil {
 		if err == ErrNoResponders {
 			err = ErrJetStreamNotEnabled
 		}
 		return nil, err
 	}
-	var info AccountInfoResponse
-	if err := json.Unmarshal(resp.Data, &info); err != nil {
-		return nil, err
-	}
-	if info.Error != nil && info.Error.Code == 503 {
-		return nil, ErrJetStreamNotEnabled
-	}
+
 	return js, nil
 }
 
@@ -167,6 +159,7 @@ func (opt jsOptFn) configureJSContext(opts *js) error {
 	return opt(opts)
 }
 
+// APIPrefix changes the default prefix used for the JetStream API.
 func APIPrefix(pre string) JSOpt {
 	return jsOptFn(func(js *js) error {
 		js.pre = pre
@@ -177,6 +170,7 @@ func APIPrefix(pre string) JSOpt {
 	})
 }
 
+// DirectOnly makes a JetStream context avoid using the JetStream API altogether.
 func DirectOnly() JSOpt {
 	return jsOptFn(func(js *js) error {
 		js.direct = true
@@ -215,11 +209,13 @@ type pubOpts struct {
 	seq uint64 // Expected last sequence
 }
 
-type PubAckResponse struct {
-	APIResponse
+// pubAckResponse is the ack response from the JetStream API when of publishing a message.
+type pubAckResponse struct {
+	apiResponse
 	*PubAck
 }
 
+// PubAck is an ack received after successfully publishing a message.
 type PubAck struct {
 	Stream    string `json:"stream"`
 	Sequence  uint64 `json:"seq"`
@@ -234,6 +230,7 @@ const (
 	ExpectedLastMsgIdHdr = "Nats-Expected-Last-Msg-Id"
 )
 
+// PublishMsg publishes a Msg to a stream from JetStream.
 func (js *js) PublishMsg(m *Msg, opts ...PubOpt) (*PubAck, error) {
 	var o pubOpts
 	if len(opts) > 0 {
@@ -282,7 +279,7 @@ func (js *js) PublishMsg(m *Msg, opts ...PubOpt) (*PubAck, error) {
 		}
 		return nil, err
 	}
-	var pa PubAckResponse
+	var pa pubAckResponse
 	if err := json.Unmarshal(resp.Data, &pa); err != nil {
 		return nil, ErrInvalidJSAck
 	}
@@ -295,11 +292,10 @@ func (js *js) PublishMsg(m *Msg, opts ...PubOpt) (*PubAck, error) {
 	return pa.PubAck, nil
 }
 
+// Publish publishes a message to a stream from JetStream.
 func (js *js) Publish(subj string, data []byte, opts ...PubOpt) (*PubAck, error) {
 	return js.PublishMsg(&Msg{Subject: subj, Data: data}, opts...)
 }
-
-// Options for publishing to JetStream.
 
 // MsgId sets the message ID used for de-duplication.
 func MsgId(id string) PubOpt {
@@ -362,13 +358,8 @@ func Context(ctx context.Context) ContextOpt {
 }
 
 // Subscribe
-// We will match subjects to streams and consumers on the user's behalf.
 
-type JSApiCreateConsumerRequest struct {
-	Stream string          `json:"stream_name"`
-	Config *ConsumerConfig `json:"config"`
-}
-
+// ConsumerConfig is the configuration of a JetStream consumer.
 type ConsumerConfig struct {
 	Durable         string        `json:"durable_name,omitempty"`
 	DeliverSubject  string        `json:"deliver_subject,omitempty"`
@@ -386,11 +377,7 @@ type ConsumerConfig struct {
 	MaxAckPending   int           `json:"max_ack_pending,omitempty"`
 }
 
-type JSApiConsumerResponse struct {
-	APIResponse
-	*ConsumerInfo
-}
-
+// ConsumerInfo is the info from a JetStream consumer.
 type ConsumerInfo struct {
 	Stream         string         `json:"stream_name"`
 	Name           string         `json:"name"`
@@ -402,18 +389,47 @@ type ConsumerInfo struct {
 	NumRedelivered int            `json:"num_redelivered"`
 	NumWaiting     int            `json:"num_waiting"`
 	NumPending     uint64         `json:"num_pending"`
+	Cluster        *ClusterInfo   `json:"cluster,omitempty"`
 }
 
+// SequencePair includes the consumer and stream sequence info from a JetStream consumer.
 type SequencePair struct {
 	Consumer uint64 `json:"consumer_seq"`
 	Stream   uint64 `json:"stream_seq"`
 }
 
-// NextRequest is for getting next messages for pull based consumers.
-type NextRequest struct {
+// nextRequest is for getting next messages for pull based consumers from JetStream.
+type nextRequest struct {
 	Expires *time.Time `json:"expires,omitempty"`
 	Batch   int        `json:"batch,omitempty"`
 	NoWait  bool       `json:"no_wait,omitempty"`
+}
+
+// jsSub includes JetStream subscription info.
+type jsSub struct {
+	js       *js
+	consumer string
+	stream   string
+	deliver  string
+	pull     int
+	durable  bool
+	attached bool
+}
+
+func (jsi *jsSub) unsubscribe(drainMode bool) error {
+	if drainMode && (jsi.durable || jsi.attached) {
+		// Skip deleting consumer for durables/attached
+		// consumers when using drain mode.
+		return nil
+	}
+
+	// Skip if in direct mode as well.
+	js := jsi.js
+	if js.direct {
+		return nil
+	}
+
+	return js.DeleteConsumer(jsi.stream, jsi.consumer)
 }
 
 // SubOpt configures options for subscribing to JetStream consumers.
@@ -444,26 +460,15 @@ func (js *js) QueueSubscribe(subj, queue string, cb MsgHandler, opts ...SubOpt) 
 	return js.subscribe(subj, queue, cb, nil, opts)
 }
 
+// QueueSubscribeSync will create a sync subscription to the appropriate stream and consumer with queue semantics.
+func (js *js) QueueSubscribeSync(subj, queue string, opts ...SubOpt) (*Subscription, error) {
+	mch := make(chan *Msg, js.nc.Opts.SubChanLen)
+	return js.subscribe(subj, queue, nil, mch, opts)
+}
+
 // Subscribe will create a subscription to the appropriate stream and consumer.
 func (js *js) ChanSubscribe(subj string, ch chan *Msg, opts ...SubOpt) (*Subscription, error) {
 	return js.subscribe(subj, _EMPTY_, nil, ch, opts)
-}
-
-// APIPaged includes variables used to create paged responses from the JSON API
-type APIPaged struct {
-	Total  int `json:"total"`
-	Offset int `json:"offset"`
-	Limit  int `json:"limit"`
-}
-
-type streamRequest struct {
-	Subject string `json:"subject,omitempty"`
-}
-
-type JSApiStreamNamesResponse struct {
-	APIResponse
-	APIPaged
-	Streams []string `json:"streams"`
 }
 
 func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []SubOpt) (*Subscription, error) {
@@ -482,15 +487,18 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 		return nil, ErrPullModeNotAllowed
 	}
 
-	var err error
-	var stream, deliver string
-	var ccfg *ConsumerConfig
+	var (
+		err          error
+		shouldCreate bool
+		ccfg         *ConsumerConfig
+		deliver      string
+		attached     bool
+		stream       = o.stream
+		consumer     = o.consumer
+		requiresAPI  = (stream == _EMPTY_ && consumer == _EMPTY_) && o.cfg.DeliverSubject == _EMPTY_
+	)
 
-	// If we are attaching to an existing consumer.
-	shouldAttach := o.stream != _EMPTY_ && o.consumer != _EMPTY_ || o.cfg.DeliverSubject != _EMPTY_
-	shouldCreate := !shouldAttach
-
-	if js.direct && shouldCreate {
+	if js.direct && requiresAPI {
 		return nil, ErrDirectModeRequired
 	}
 
@@ -500,33 +508,49 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 		} else {
 			deliver = NewInbox()
 		}
-	} else if shouldAttach {
-		info, err := js.getConsumerInfo(o.stream, o.consumer)
-		if err != nil {
-			return nil, err
-		}
-
-		ccfg = &info.Config
-		// Make sure this new subject matches or is a subset.
-		if ccfg.FilterSubject != _EMPTY_ && subj != ccfg.FilterSubject {
-			return nil, ErrSubjectMismatch
-		}
-		if ccfg.DeliverSubject != _EMPTY_ {
-			deliver = ccfg.DeliverSubject
-		} else {
-			deliver = NewInbox()
-		}
 	} else {
+		// Find the stream mapped to the subject.
 		stream, err = js.lookupStreamBySubject(subj)
 		if err != nil {
 			return nil, err
 		}
-		deliver = NewInbox()
-		if !isPullMode {
-			cfg.DeliverSubject = deliver
+
+		// With an explicit durable name, then can lookup
+		// the consumer to which it should be attaching to.
+		var info *ConsumerInfo
+		consumer = o.cfg.Durable
+		if consumer != _EMPTY_ {
+			// Only create in case there is no consumer already.
+			info, err = js.ConsumerInfo(stream, consumer)
+			if err != nil && err.Error() != `consumer not found` {
+				return nil, err
+			}
 		}
-		// Do filtering always, server will clear as needed.
-		cfg.FilterSubject = subj
+
+		if info != nil {
+			// Attach using the found consumer config.
+			ccfg = &info.Config
+			attached = true
+
+			// Make sure this new subject matches or is a subset.
+			if ccfg.FilterSubject != _EMPTY_ && subj != ccfg.FilterSubject {
+				return nil, ErrSubjectMismatch
+			}
+
+			if ccfg.DeliverSubject != _EMPTY_ {
+				deliver = ccfg.DeliverSubject
+			} else {
+				deliver = NewInbox()
+			}
+		} else {
+			shouldCreate = true
+			deliver = NewInbox()
+			if !isPullMode {
+				cfg.DeliverSubject = deliver
+			}
+			// Do filtering always, server will clear as needed.
+			cfg.FilterSubject = subj
+		}
 	}
 
 	var sub *Subscription
@@ -536,7 +560,6 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 		ocb := cb
 		cb = func(m *Msg) { ocb(m); m.Ack() }
 	}
-
 	sub, err = js.nc.subscribe(deliver, queue, cb, ch, cb == nil, &jsSub{js: js})
 	if err != nil {
 		return nil, err
@@ -546,17 +569,17 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 	if shouldCreate {
 		// If not set default to ack explicit.
 		if cfg.AckPolicy == ackPolicyNotSet {
-			cfg.AckPolicy = AckExplicit
+			cfg.AckPolicy = AckExplicitPolicy
 		}
 		// If we have acks at all and the MaxAckPending is not set go ahead
 		// and set to the internal max.
 		// TODO(dlc) - We should be able to update this if client updates PendingLimits.
-		if cfg.MaxAckPending == 0 && cfg.AckPolicy != AckNone {
+		if cfg.MaxAckPending == 0 && cfg.AckPolicy != AckNonePolicy {
 			maxMsgs, _, _ := sub.PendingLimits()
 			cfg.MaxAckPending = maxMsgs
 		}
 
-		req := &JSApiCreateConsumerRequest{
+		req := &createConsumerRequest{
 			Stream: stream,
 			Config: &cfg,
 		}
@@ -567,10 +590,11 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 		}
 
 		var ccSubj string
-		if cfg.Durable != _EMPTY_ {
-			ccSubj = fmt.Sprintf(JSApiDurableCreateT, stream, cfg.Durable)
+		isDurable := cfg.Durable != _EMPTY_
+		if isDurable {
+			ccSubj = fmt.Sprintf(apiDurableCreateT, stream, cfg.Durable)
 		} else {
-			ccSubj = fmt.Sprintf(JSApiConsumerCreateT, stream)
+			ccSubj = fmt.Sprintf(apiConsumerCreateT, stream)
 		}
 
 		resp, err := js.nc.Request(js.apiSubj(ccSubj), j, js.wait)
@@ -582,7 +606,7 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 			return nil, err
 		}
 
-		var info JSApiConsumerResponse
+		var info consumerResponse
 		err = json.Unmarshal(resp.Data, &info)
 		if err != nil {
 			sub.Unsubscribe()
@@ -597,15 +621,17 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 		sub.jsi.stream = info.Stream
 		sub.jsi.consumer = info.Name
 		sub.jsi.deliver = info.Config.DeliverSubject
+		sub.jsi.durable = isDurable
 	} else {
-		sub.jsi.stream = o.stream
-		sub.jsi.consumer = o.consumer
+		sub.jsi.stream = stream
+		sub.jsi.consumer = consumer
 		if js.direct {
 			sub.jsi.deliver = o.cfg.DeliverSubject
 		} else {
 			sub.jsi.deliver = ccfg.DeliverSubject
 		}
 	}
+	sub.jsi.attached = attached
 
 	// If we are pull based go ahead and fire off the first request to populate.
 	if isPullMode {
@@ -616,15 +642,24 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 	return sub, nil
 }
 
+type streamRequest struct {
+	Subject string `json:"subject,omitempty"`
+}
+
+type streamNamesResponse struct {
+	apiResponse
+	apiPaged
+	Streams []string `json:"streams"`
+}
+
 func (js *js) lookupStreamBySubject(subj string) (string, error) {
-	var slr JSApiStreamNamesResponse
-	// FIXME(dlc) - prefix
+	var slr streamNamesResponse
 	req := &streamRequest{subj}
 	j, err := json.Marshal(req)
 	if err != nil {
 		return _EMPTY_, err
 	}
-	resp, err := js.nc.Request(js.apiSubj(JSApiStreams), j, js.wait)
+	resp, err := js.nc.Request(js.apiSubj(apiStreams), j, js.wait)
 	if err != nil {
 		if err == ErrNoResponders {
 			err = ErrJetStreamNotEnabled
@@ -651,21 +686,20 @@ type subOpts struct {
 	cfg *ConsumerConfig
 }
 
+// Durable defines the consumer name for JetStream durable subscribers.
 func Durable(name string) SubOpt {
 	return subOptFn(func(opts *subOpts) error {
+		if strings.Contains(name, ".") {
+			return ErrInvalidDurableName
+		}
+
 		opts.cfg.Durable = name
 		return nil
 	})
 }
 
-func Attach(stream, consumer string) SubOpt {
-	return subOptFn(func(opts *subOpts) error {
-		opts.stream = stream
-		opts.consumer = consumer
-		return nil
-	})
-}
-
+// Pull defines the batch size of messages that will be received
+// when using pull based JetStream consumers.
 func Pull(batchSize int) SubOpt {
 	return subOptFn(func(opts *subOpts) error {
 		if batchSize == 0 {
@@ -688,13 +722,7 @@ func PullDirect(stream, consumer string, batchSize int) SubOpt {
 	})
 }
 
-func PushDirect(deliverSubject string) SubOpt {
-	return subOptFn(func(opts *subOpts) error {
-		opts.cfg.DeliverSubject = deliverSubject
-		return nil
-	})
-}
-
+// ManualAck disables auto ack functionality for async subscriptions.
 func ManualAck() SubOpt {
 	return subOptFn(func(opts *subOpts) error {
 		opts.mack = true
@@ -739,12 +767,33 @@ func StartSequence(seq uint64) SubOpt {
 	})
 }
 
-// DeliverFromTime configures a Consumer to receive
+// StartTime configures a Consumer to receive
 // messages from a start time.
 func StartTime(startTime time.Time) SubOpt {
 	return subOptFn(func(opts *subOpts) error {
 		opts.cfg.DeliverPolicy = DeliverByStartTimePolicy
 		opts.cfg.OptStartTime = &startTime
+		return nil
+	})
+}
+
+func AckNone() SubOpt {
+	return subOptFn(func(opts *subOpts) error {
+		opts.cfg.AckPolicy = AckNonePolicy
+		return nil
+	})
+}
+
+func AckAll() SubOpt {
+	return subOptFn(func(opts *subOpts) error {
+		opts.cfg.AckPolicy = AckAllPolicy
+		return nil
+	})
+}
+
+func AckExplicit() SubOpt {
+	return subOptFn(func(opts *subOpts) error {
+		opts.cfg.AckPolicy = AckExplicitPolicy
 		return nil
 	})
 }
@@ -757,7 +806,13 @@ func (sub *Subscription) ConsumerInfo() (*ConsumerInfo, error) {
 		return nil, ErrTypeSubscription
 	}
 
+	// Consumer info lookup should fail if in direct mode.
 	js := sub.jsi.js
+	if js.direct {
+		sub.mu.Unlock()
+		return nil, ErrDirectModeRequired
+	}
+
 	stream, consumer := sub.jsi.stream, sub.jsi.consumer
 	sub.mu.Unlock()
 
@@ -776,14 +831,13 @@ func (sub *Subscription) Poll() error {
 	js := sub.jsi.js
 	sub.mu.Unlock()
 
-	req, _ := json.Marshal(&NextRequest{Batch: batch})
-	reqNext := js.apiSubj(fmt.Sprintf(JSApiRequestNextT, stream, consumer))
+	req, _ := json.Marshal(&nextRequest{Batch: batch})
+	reqNext := js.apiSubj(fmt.Sprintf(apiRequestNextT, stream, consumer))
 	return nc.PublishRequest(reqNext, reply, req)
 }
 
 func (js *js) getConsumerInfo(stream, consumer string) (*ConsumerInfo, error) {
-	// FIXME(dlc) - prefix
-	ccInfoSubj := fmt.Sprintf(JSApiConsumerInfoT, stream, consumer)
+	ccInfoSubj := fmt.Sprintf(apiConsumerInfoT, stream, consumer)
 	resp, err := js.nc.Request(js.apiSubj(ccInfoSubj), nil, js.wait)
 	if err != nil {
 		if err == ErrNoResponders {
@@ -792,7 +846,7 @@ func (js *js) getConsumerInfo(stream, consumer string) (*ConsumerInfo, error) {
 		return nil, err
 	}
 
-	var info JSApiConsumerResponse
+	var info consumerResponse
 	if err := json.Unmarshal(resp.Data, &info); err != nil {
 		return nil, err
 	}
@@ -813,7 +867,9 @@ func (m *Msg) checkReply() (*js, bool, error) {
 	sub.mu.Lock()
 	if sub.jsi == nil {
 		sub.mu.Unlock()
-		return nil, false, ErrNotJSMessage
+
+		// Not using a JS context.
+		return nil, false, nil
 	}
 	js := sub.jsi.js
 	isPullMode := sub.jsi.pull > 0
@@ -823,25 +879,66 @@ func (m *Msg) checkReply() (*js, bool, error) {
 }
 
 // ackReply handles all acks. Will do the right thing for pull and sync mode.
-func (m *Msg) ackReply(ackType []byte, sync bool) error {
+// It ensures that an ack is only sent a single time, regardless of
+// how many times it is being called to avoid duplicated acks.
+func (m *Msg) ackReply(ackType []byte, sync bool, opts ...PubOpt) error {
+	var o pubOpts
+	for _, opt := range opts {
+		if err := opt.configurePublish(&o); err != nil {
+			return err
+		}
+	}
 	js, isPullMode, err := m.checkReply()
 	if err != nil {
 		return err
 	}
+
+	// Skip if already acked.
+	if atomic.LoadUint32(&m.ackd) == 1 {
+		return ErrInvalidJSAck
+	}
+
+	m.Sub.mu.Lock()
+	nc := m.Sub.conn
+	m.Sub.mu.Unlock()
+
+	ctx := o.ctx
+	wait := defaultRequestWait
+	if o.ttl > 0 {
+		wait = o.ttl
+	} else if js != nil {
+		wait = js.wait
+	}
+
 	if isPullMode {
 		if bytes.Equal(ackType, AckAck) {
-			err = js.nc.PublishRequest(m.Reply, m.Sub.Subject, AckNext)
+			err = nc.PublishRequest(m.Reply, m.Sub.Subject, AckNext)
 		} else if bytes.Equal(ackType, AckNak) || bytes.Equal(ackType, AckTerm) {
-			err = js.nc.PublishRequest(m.Reply, m.Sub.Subject, []byte("+NXT {\"batch\":1}"))
+			err = nc.PublishRequest(m.Reply, m.Sub.Subject, []byte("+NXT {\"batch\":1}"))
 		}
 		if sync && err == nil {
-			_, err = js.nc.Request(m.Reply, nil, js.wait)
+			if ctx != nil {
+				_, err = nc.RequestWithContext(ctx, m.Reply, nil)
+			} else {
+				_, err = nc.Request(m.Reply, nil, wait)
+			}
 		}
 	} else if sync {
-		_, err = js.nc.Request(m.Reply, ackType, js.wait)
+		if ctx != nil {
+			_, err = nc.RequestWithContext(ctx, m.Reply, ackType)
+		} else {
+			_, err = nc.Request(m.Reply, ackType, wait)
+		}
 	} else {
-		err = js.nc.Publish(m.Reply, ackType)
+		err = nc.Publish(m.Reply, ackType)
 	}
+
+	// Mark that the message has been acked unless it is AckProgress
+	// which can be sent many times.
+	if err == nil && !bytes.Equal(ackType, AckProgress) {
+		atomic.StoreUint32(&m.ackd, 1)
+	}
+
 	return err
 }
 
@@ -853,8 +950,8 @@ func (m *Msg) Ack() error {
 }
 
 // Ack a message and wait for a response from the server.
-func (m *Msg) AckSync() error {
-	return m.ackReply(AckAck, true)
+func (m *Msg) AckSync(opts ...PubOpt) error {
+	return m.ackReply(AckAck, true, opts...)
 }
 
 // Nak this message, indicating we can not process.
@@ -867,12 +964,13 @@ func (m *Msg) Term() error {
 	return m.ackReply(AckTerm, false)
 }
 
-// Indicate that this message is being worked on and reset redelkivery timer in the server.
+// InProgress indicates that this message is being worked on
+// and reset the redelivery timer in the server.
 func (m *Msg) InProgress() error {
 	return m.ackReply(AckProgress, false)
 }
 
-// JetStream metadata associated with received messages.
+// MsgMetadata is the JetStream metadata associated with received messages.
 type MsgMetaData struct {
 	Consumer  uint64
 	Stream    uint64
@@ -881,6 +979,7 @@ type MsgMetaData struct {
 	Timestamp time.Time
 }
 
+// MetaData retrieves the metadata from a JetStream message.
 func (m *Msg) MetaData() (*MsgMetaData, error) {
 	if _, _, err := m.checkReply(); err != nil {
 		return nil, err
@@ -935,14 +1034,18 @@ func parseNum(d string) (n int64) {
 	return n
 }
 
-// Additional jetstream structures.
-
+// AckPolicy determines how the consumer should acknowledge delivered messages.
 type AckPolicy int
 
 const (
-	AckNone AckPolicy = iota
-	AckAll
-	AckExplicit
+	// AckNonePolicy requires no acks for delivered messages.
+	AckNonePolicy AckPolicy = iota
+
+	// AckAllPolicy when acking a sequence number, this implicitly acks all sequences below this one as well.
+	AckAllPolicy
+
+	// AckExplicit requires ack or nack for all messages.
+	AckExplicitPolicy
 
 	// For setting
 	ackPolicyNotSet = 99
@@ -955,11 +1058,11 @@ func jsonString(s string) string {
 func (p *AckPolicy) UnmarshalJSON(data []byte) error {
 	switch string(data) {
 	case jsonString("none"):
-		*p = AckNone
+		*p = AckNonePolicy
 	case jsonString("all"):
-		*p = AckAll
+		*p = AckAllPolicy
 	case jsonString("explicit"):
-		*p = AckExplicit
+		*p = AckExplicitPolicy
 	default:
 		return fmt.Errorf("can not unmarshal %q", data)
 	}
@@ -969,11 +1072,11 @@ func (p *AckPolicy) UnmarshalJSON(data []byte) error {
 
 func (p AckPolicy) MarshalJSON() ([]byte, error) {
 	switch p {
-	case AckNone:
+	case AckNonePolicy:
 		return json.Marshal("none")
-	case AckAll:
+	case AckAllPolicy:
 		return json.Marshal("all")
-	case AckExplicit:
+	case AckExplicitPolicy:
 		return json.Marshal("explicit")
 	default:
 		return nil, fmt.Errorf("unknown acknowlegement policy %v", p)
@@ -982,11 +1085,11 @@ func (p AckPolicy) MarshalJSON() ([]byte, error) {
 
 func (p AckPolicy) String() string {
 	switch p {
-	case AckNone:
+	case AckNonePolicy:
 		return "AckNone"
-	case AckAll:
+	case AckAllPolicy:
 		return "AckAll"
-	case AckExplicit:
+	case AckExplicitPolicy:
 		return "AckExplicit"
 	case ackPolicyNotSet:
 		return "Not Initialized"
@@ -1089,131 +1192,6 @@ func (p DeliverPolicy) MarshalJSON() ([]byte, error) {
 	}
 }
 
-// Management for JetStream
-// TODO(dlc) - Fill this out.
-
-// AddConsumer will add a JetStream consumer.
-func (js *js) AddConsumer(stream string, cfg *ConsumerConfig) (*ConsumerInfo, error) {
-	if stream == _EMPTY_ {
-		return nil, ErrStreamNameRequired
-	}
-	req, err := json.Marshal(&JSApiCreateConsumerRequest{Stream: stream, Config: cfg})
-	if err != nil {
-		return nil, err
-	}
-
-	var ccSubj string
-	if cfg.Durable != _EMPTY_ {
-		ccSubj = fmt.Sprintf(JSApiDurableCreateT, stream, cfg.Durable)
-	} else {
-		ccSubj = fmt.Sprintf(JSApiConsumerCreateT, stream)
-	}
-
-	resp, err := js.nc.Request(js.apiSubj(ccSubj), req, js.wait)
-	if err != nil {
-		if err == ErrNoResponders {
-			err = ErrJetStreamNotEnabled
-		}
-		return nil, err
-	}
-	var info JSApiConsumerResponse
-	err = json.Unmarshal(resp.Data, &info)
-	if err != nil {
-		return nil, err
-	}
-	if info.Error != nil {
-		return nil, errors.New(info.Error.Description)
-	}
-	return info.ConsumerInfo, nil
-}
-
-// StreamConfig will determine the properties for a stream.
-// There are sensible defaults for most. If no subjects are
-// given the name will be used as the only subject.
-type StreamConfig struct {
-	Name         string          `json:"name"`
-	Subjects     []string        `json:"subjects,omitempty"`
-	Retention    RetentionPolicy `json:"retention"`
-	MaxConsumers int             `json:"max_consumers"`
-	MaxMsgs      int64           `json:"max_msgs"`
-	MaxBytes     int64           `json:"max_bytes"`
-	Discard      DiscardPolicy   `json:"discard"`
-	MaxAge       time.Duration   `json:"max_age"`
-	MaxMsgSize   int32           `json:"max_msg_size,omitempty"`
-	Storage      StorageType     `json:"storage"`
-	Replicas     int             `json:"num_replicas"`
-	NoAck        bool            `json:"no_ack,omitempty"`
-	Template     string          `json:"template_owner,omitempty"`
-	Duplicates   time.Duration   `json:"duplicate_window,omitempty"`
-}
-
-// JSApiStreamCreateResponse stream creation.
-type JSApiStreamCreateResponse struct {
-	APIResponse
-	*StreamInfo
-}
-
-func (js *js) AddStream(cfg *StreamConfig) (*StreamInfo, error) {
-	if cfg == nil || cfg.Name == _EMPTY_ {
-		return nil, ErrStreamNameRequired
-	}
-
-	req, err := json.Marshal(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	csSubj := js.apiSubj(fmt.Sprintf(JSApiStreamCreateT, cfg.Name))
-	r, err := js.nc.Request(csSubj, req, js.wait)
-	if err != nil {
-		return nil, err
-	}
-	var resp JSApiStreamCreateResponse
-	if err := json.Unmarshal(r.Data, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Error != nil {
-		return nil, errors.New(resp.Error.Description)
-	}
-	return resp.StreamInfo, nil
-}
-
-type JSApiStreamInfoResponse = JSApiStreamCreateResponse
-
-func (js *js) StreamInfo(stream string) (*StreamInfo, error) {
-	csSubj := js.apiSubj(fmt.Sprintf(JSApiStreamInfoT, stream))
-	r, err := js.nc.Request(csSubj, nil, js.wait)
-	if err != nil {
-		return nil, err
-	}
-	var resp JSApiStreamInfoResponse
-	if err := json.Unmarshal(r.Data, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Error != nil {
-		return nil, errors.New(resp.Error.Description)
-	}
-	return resp.StreamInfo, nil
-}
-
-// StreamInfo shows config and current state for this stream.
-type StreamInfo struct {
-	Config  StreamConfig `json:"config"`
-	Created time.Time    `json:"created"`
-	State   StreamState  `json:"state"`
-}
-
-// StreamStats is information about the given stream.
-type StreamState struct {
-	Msgs      uint64    `json:"messages"`
-	Bytes     uint64    `json:"bytes"`
-	FirstSeq  uint64    `json:"first_seq"`
-	FirstTime time.Time `json:"first_ts"`
-	LastSeq   uint64    `json:"last_seq"`
-	LastTime  time.Time `json:"last_ts"`
-	Consumers int       `json:"consumer_count"`
-}
-
 // RetentionPolicy determines how messages in a set are retained.
 type RetentionPolicy int
 
@@ -1227,7 +1205,7 @@ const (
 	WorkQueuePolicy
 )
 
-// Discard Policy determines how we proceed when limits of messages or bytes are hit. The default, DicscardOld will
+// DiscardPolicy determines how we proceed when limits of messages or bytes are hit. The default, DiscardOld will
 // remove older messages. DiscardNew will fail to store the new message.
 type DiscardPolicy int
 
