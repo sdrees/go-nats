@@ -116,7 +116,7 @@ func TestJetStreamPublish(t *testing.T) {
 	}
 
 	// Lookup the stream for testing.
-	mset, err := s.GlobalAccount().LookupStream("TEST")
+	_, err = js.StreamInfo("TEST")
 	if err != nil {
 		t.Fatalf("stream lookup failed: %v", err)
 	}
@@ -135,8 +135,13 @@ func TestJetStreamPublish(t *testing.T) {
 				t.Fatalf("Wrong stream sequence, expected %d, got %d", seq, pa.Sequence)
 			}
 		}
-		if state := mset.State(); state.Msgs != nmsgs {
-			t.Fatalf("Expected %d messages, got %d", nmsgs, state.Msgs)
+
+		stream, err := js.StreamInfo("TEST")
+		if err != nil {
+			t.Fatalf("stream lookup failed: %v", err)
+		}
+		if stream.State.Msgs != nmsgs {
+			t.Fatalf("Expected %d messages, got %d", nmsgs, stream.State.Msgs)
 		}
 	}
 
@@ -206,7 +211,7 @@ func TestJetStreamPublish(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	_, err = js.Publish("foo", msg, nats.MaxWait(time.Second), nats.Context(ctx))
+	_, err = js.Publish("foo", msg, nats.AckWait(time.Second), nats.Context(ctx))
 	if err != nats.ErrContextAndTimeout {
 		t.Fatalf("Expected %q, got %q", nats.ErrContextAndTimeout, err)
 	}
@@ -215,7 +220,7 @@ func TestJetStreamPublish(t *testing.T) {
 	sub, _ := nc.SubscribeSync("baz")
 	defer sub.Unsubscribe()
 
-	_, err = js.Publish("baz", msg, nats.MaxWait(time.Nanosecond))
+	_, err = js.Publish("baz", msg, nats.AckWait(time.Nanosecond))
 	if err != nats.ErrTimeout {
 		t.Fatalf("Expected %q, got %q", nats.ErrTimeout, err)
 	}
@@ -274,8 +279,9 @@ func TestJetStreamSubscribe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
+
 	// Lookup the stream for testing.
-	mset, err := s.GlobalAccount().LookupStream("TEST")
+	_, err = js.StreamInfo("TEST")
 	if err != nil {
 		t.Fatalf("stream lookup failed: %v", err)
 	}
@@ -327,14 +333,9 @@ func TestJetStreamSubscribe(t *testing.T) {
 
 	waitForPending(t, 1)
 
-	// Make sure we are set to explicit ack for callback based subscriptions and that the messages go down etc.
-	mset.Purge()
 	toSend := 10
 	for i := 0; i < toSend; i++ {
 		js.Publish("bar", msg)
-	}
-	if state := mset.State(); state.Msgs != 10 {
-		t.Fatalf("Expected %d messages, got %d", toSend, state.Msgs)
 	}
 
 	done := make(chan bool, 1)
@@ -560,6 +561,347 @@ func TestJetStreamSubscribe(t *testing.T) {
 	// Prevent invalid durable names
 	if _, err := js.SubscribeSync("baz", nats.Durable("test.durable")); err != nats.ErrInvalidDurableName {
 		t.Fatalf("Expected invalid durable name error")
+	}
+
+	ackWait := 1 * time.Millisecond
+	sub, err = js.SubscribeSync("bar", nats.Durable("ack-wait"), nats.AckWait(ackWait))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	_, err = sub.NextMsg(1 * time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	info, err = sub.ConsumerInfo()
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if info.Config.AckWait != ackWait {
+		t.Errorf("Expected %v, got %v", ackWait, info.Config.AckWait)
+	}
+}
+
+func TestJetStreamAckPending_Pull(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	const totalMsgs = 3
+	for i := 0; i < totalMsgs; i++ {
+		if _, err := js.Publish("foo", []byte(fmt.Sprintf("msg %d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sub, err := js.SubscribeSync("foo",
+		nats.Durable("dname-pull-ack-wait"),
+		nats.AckWait(100*time.Millisecond),
+		nats.MaxDeliver(5),
+		nats.MaxAckPending(3),
+		nats.Pull(15),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+
+	// 3 messages delivered 5 times.
+	expected := 15
+	timeout := time.Now().Add(2 * time.Second)
+	pending := 0
+	for time.Now().Before(timeout) {
+		if pending, _, _ = sub.Pending(); pending >= expected {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pending < expected {
+		t.Errorf("Expected %v, got %v", expected, pending)
+	}
+
+	info, err := sub.ConsumerInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := info.NumRedelivered
+	expected = 3
+	if got < expected {
+		t.Errorf("Expected %v, got: %v", expected, got)
+	}
+
+	got = info.NumAckPending
+	expected = 3
+	if got < expected {
+		t.Errorf("Expected %v, got: %v", expected, got)
+	}
+
+	got = info.NumWaiting
+	expected = 0
+	if got != expected {
+		t.Errorf("Expected %v, got: %v", expected, got)
+	}
+
+	got = int(info.NumPending)
+	expected = 0
+	if got != expected {
+		t.Errorf("Expected %v, got: %v", expected, got)
+	}
+
+	got = info.Config.MaxAckPending
+	expected = 3
+	if got != expected {
+		t.Errorf("Expected %v, got %v", expected, pending)
+	}
+
+	got = info.Config.MaxDeliver
+	expected = 5
+	if got != expected {
+		t.Errorf("Expected %v, got %v", expected, pending)
+	}
+
+	acks := map[int]int{}
+
+	ackPending := 3
+	timeout = time.Now().Add(2 * time.Second)
+	for time.Now().Before(timeout) {
+		info, err := sub.ConsumerInfo()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := info.NumAckPending, ackPending; got > 0 && got != want {
+			t.Fatalf("unexpected num ack pending: got=%d, want=%d", got, want)
+		}
+
+		// Continue to ack all messages until no more pending.
+		pending, _, _ = sub.Pending()
+		if pending == 0 {
+			break
+		}
+
+		m, err := sub.NextMsg(100 * time.Millisecond)
+		if err != nil {
+			t.Fatalf("Error getting next message: %v", err)
+		}
+
+		if err := m.AckSync(); err != nil {
+			t.Fatalf("Error on ack message: %v", err)
+		}
+
+		meta, err := m.MetaData()
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
+		acks[int(meta.Stream)]++
+
+		if ackPending != 0 {
+			ackPending--
+		}
+		if int(meta.Pending) != ackPending {
+			t.Errorf("Expected %v, got %v", ackPending, meta.Pending)
+		}
+	}
+
+	got = len(acks)
+	expected = 3
+	if got != expected {
+		t.Errorf("Expected %v, got %v", expected, got)
+	}
+
+	expected = 5
+	for _, got := range acks {
+		if got != expected {
+			t.Errorf("Expected %v, got %v", expected, got)
+		}
+	}
+
+	_, err = sub.NextMsg(100 * time.Millisecond)
+	if err != nats.ErrTimeout {
+		t.Errorf("Expected timeout, got: %v", err)
+	}
+}
+
+func TestJetStreamAckPending_Push(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	const totalMsgs = 3
+	for i := 0; i < totalMsgs; i++ {
+		if _, err := js.Publish("foo", []byte(fmt.Sprintf("msg %d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sub, err := js.SubscribeSync("foo",
+		nats.Durable("dname-wait"),
+		nats.AckWait(100*time.Millisecond),
+		nats.MaxDeliver(5),
+		nats.MaxAckPending(3),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Unsubscribe()
+
+	// 3 messages delivered 5 times.
+	expected := 15
+	timeout := time.Now().Add(2 * time.Second)
+	pending := 0
+	for time.Now().Before(timeout) {
+		if pending, _, _ = sub.Pending(); pending >= expected {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if pending < expected {
+		t.Errorf("Expected %v, got %v", expected, pending)
+	}
+
+	info, err := sub.ConsumerInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := info.NumRedelivered
+	expected = 3
+	if got < expected {
+		t.Errorf("Expected %v, got: %v", expected, got)
+	}
+
+	got = info.NumAckPending
+	expected = 3
+	if got < expected {
+		t.Errorf("Expected %v, got: %v", expected, got)
+	}
+
+	got = info.NumWaiting
+	expected = 0
+	if got != expected {
+		t.Errorf("Expected %v, got: %v", expected, got)
+	}
+
+	got = int(info.NumPending)
+	expected = 0
+	if got != expected {
+		t.Errorf("Expected %v, got: %v", expected, got)
+	}
+
+	got = info.Config.MaxAckPending
+	expected = 3
+	if got != expected {
+		t.Errorf("Expected %v, got %v", expected, pending)
+	}
+
+	got = info.Config.MaxDeliver
+	expected = 5
+	if got != expected {
+		t.Errorf("Expected %v, got %v", expected, pending)
+	}
+
+	acks := map[int]int{}
+
+	ackPending := 3
+	timeout = time.Now().Add(2 * time.Second)
+	for time.Now().Before(timeout) {
+		info, err := sub.ConsumerInfo()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := info.NumAckPending, ackPending; got > 0 && got != want {
+			t.Fatalf("unexpected num ack pending: got=%d, want=%d", got, want)
+		}
+
+		// Continue to ack all messages until no more pending.
+		pending, _, _ = sub.Pending()
+		if pending == 0 {
+			break
+		}
+
+		m, err := sub.NextMsg(100 * time.Millisecond)
+		if err != nil {
+			t.Fatalf("Error getting next message: %v", err)
+		}
+
+		if err := m.AckSync(); err != nil {
+			t.Fatalf("Error on ack message: %v", err)
+		}
+
+		meta, err := m.MetaData()
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
+		acks[int(meta.Stream)]++
+
+		if ackPending != 0 {
+			ackPending--
+		}
+		if int(meta.Pending) != ackPending {
+			t.Errorf("Expected %v, got %v", ackPending, meta.Pending)
+		}
+	}
+
+	got = len(acks)
+	expected = 3
+	if got != expected {
+		t.Errorf("Expected %v, got %v", expected, got)
+	}
+
+	expected = 5
+	for _, got := range acks {
+		if got != expected {
+			t.Errorf("Expected %v, got %v", expected, got)
+		}
+	}
+
+	_, err = sub.NextMsg(100 * time.Millisecond)
+	if err != nats.ErrTimeout {
+		t.Errorf("Expected timeout, got: %v", err)
 	}
 }
 
@@ -1147,17 +1489,27 @@ func TestJetStreamImport(t *testing.T) {
 		defer os.RemoveAll(config.StoreDir)
 	}
 
-	// Create a stream using the server directly.
-	acc, _ := s.LookupAccount("JS")
-	mset, err := acc.AddStream(&server.StreamConfig{
+	// Create a stream using JSM.
+	ncm, err := nats.Connect(s.ClientURL(), nats.UserInfo("dlc", "foo"))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer ncm.Close()
+
+	jsm, err := ncm.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = jsm.AddStream(&nats.StreamConfig{
 		Name:     "TEST",
 		Subjects: []string{"foo", "bar"},
 	})
 	if err != nil {
 		t.Fatalf("stream create failed: %v", err)
 	}
-	defer mset.Delete()
 
+	// Client with the imports.
 	nc, err := nats.Connect(s.ClientURL())
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -1174,9 +1526,6 @@ func TestJetStreamImport(t *testing.T) {
 
 	if _, err = js.Publish("foo", msg); err != nil {
 		t.Fatalf("Unexpected publish error: %v", err)
-	}
-	if state := mset.State(); state.Msgs != 1 {
-		t.Fatalf("Expected %d messages, got %d", 1, state.Msgs)
 	}
 }
 
@@ -1222,41 +1571,48 @@ func TestJetStreamImportDirectOnly(t *testing.T) {
 		defer os.RemoveAll(config.StoreDir)
 	}
 
+	// Create a stream using JSM.
+	ncm, err := nats.Connect(s.ClientURL(), nats.UserInfo("dlc", "foo"))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer ncm.Close()
+
+	jsm, err := ncm.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// Create a stream using the server directly.
-	acc, _ := s.LookupAccount("JS")
-	mset, err := acc.AddStream(&server.StreamConfig{Name: "ORDERS"})
+	_, err = jsm.AddStream(&nats.StreamConfig{Name: "ORDERS"})
 	if err != nil {
 		t.Fatalf("stream create failed: %v", err)
 	}
-	defer mset.Delete()
 
 	// Create a pull based consumer.
-	o1, err := mset.AddConsumer(&server.ConsumerConfig{Durable: "d1", AckPolicy: server.AckExplicit})
+	_, err = jsm.AddConsumer("ORDERS", &nats.ConsumerConfig{Durable: "d1", AckPolicy: nats.AckExplicitPolicy})
 	if err != nil {
 		t.Fatalf("pull consumer create failed: %v", err)
 	}
-	defer o1.Delete()
 
 	// Create a push based consumers.
-	o2, err := mset.AddConsumer(&server.ConsumerConfig{
+	_, err = jsm.AddConsumer("ORDERS", &nats.ConsumerConfig{
 		Durable:        "d2",
-		AckPolicy:      server.AckExplicit,
+		AckPolicy:      nats.AckExplicitPolicy,
 		DeliverSubject: "p.d",
 	})
 	if err != nil {
 		t.Fatalf("push consumer create failed: %v", err)
 	}
-	defer o2.Delete()
 
-	o3, err := mset.AddConsumer(&server.ConsumerConfig{
+	_, err = jsm.AddConsumer("ORDERS", &nats.ConsumerConfig{
 		Durable:        "d3",
-		AckPolicy:      server.AckExplicit,
+		AckPolicy:      nats.AckExplicitPolicy,
 		DeliverSubject: "p.d3",
 	})
 	if err != nil {
 		t.Fatalf("push consumer create failed: %v", err)
 	}
-	defer o3.Delete()
 
 	nc, err := nats.Connect(s.ClientURL())
 	if err != nil {
@@ -1275,9 +1631,6 @@ func TestJetStreamImportDirectOnly(t *testing.T) {
 		if _, err := js.Publish("orders", []byte(fmt.Sprintf("ORDER-%d", i+1))); err != nil {
 			t.Fatalf("Unexpected error publishing message %d: %v", i+1, err)
 		}
-	}
-	if state := mset.State(); state.Msgs != uint64(toSend) {
-		t.Fatalf("Expected %d messages, got %d", toSend, state.Msgs)
 	}
 
 	// Check for correct errors.
@@ -1361,7 +1714,7 @@ func TestJetStreamAutoMaxAckPending(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	mset, err := s.GlobalAccount().AddStream(&server.StreamConfig{Name: "foo"})
+	_, err = js.AddStream(&nats.StreamConfig{Name: "foo"})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1374,10 +1727,6 @@ func TestJetStreamAutoMaxAckPending(t *testing.T) {
 		nc.Publish("foo", msg)
 	}
 	nc.Flush()
-
-	if state := mset.State(); state.Msgs != uint64(toSend) {
-		t.Fatalf("Expected %d messages, got %d", toSend, state.Msgs)
-	}
 
 	// Create a consumer.
 	msgs := make(chan *nats.Msg, 500)
@@ -1508,8 +1857,8 @@ func TestJetStreamPullBasedStall(t *testing.T) {
 	if _, err = js.AddStream(&nats.StreamConfig{Name: "STALL"}); err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	acc, _ := s.LookupAccount("JS")
-	mset, err := acc.LookupStream("STALL")
+
+	_, err = js.StreamInfo("STALL")
 	if err != nil {
 		t.Fatalf("stream lookup failed: %v", err)
 	}
@@ -1521,10 +1870,6 @@ func TestJetStreamPullBasedStall(t *testing.T) {
 		nc.Publish("STALL", msg)
 	}
 	nc.Flush()
-
-	if state := mset.State(); state.Msgs != uint64(toSend) {
-		t.Fatalf("Expected %d messages, got %d", toSend, state.Msgs)
-	}
 
 	batch := 100
 	msgs := make(chan *nats.Msg, batch-2)
@@ -1719,12 +2064,10 @@ func TestJetStreamSubscribe_AckPolicy(t *testing.T) {
 	}
 
 	checkAcks := func(t *testing.T, sub *nats.Subscription) {
-		t.Helper()
-
 		// Normal Ack
 		msg, err := sub.NextMsg(2 * time.Second)
 		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
+			t.Fatalf("Unexpected error: %v", err)
 		}
 
 		meta, err := msg.MetaData()
@@ -1755,10 +2098,6 @@ func TestJetStreamSubscribe_AckPolicy(t *testing.T) {
 		if got != expected {
 			t.Errorf("Expected %v, got %v", expected, got)
 		}
-		err = msg.AckSync(nats.MaxWait(1 * time.Nanosecond))
-		if err != nats.ErrTimeout {
-			t.Errorf("Unexpected error: %v", err)
-		}
 
 		// Give an already canceled context.
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1775,6 +2114,11 @@ func TestJetStreamSubscribe_AckPolicy(t *testing.T) {
 
 		err = msg.AckSync(nats.Context(ctx))
 		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
+
+		err = msg.AckSync(nats.AckWait(2 * time.Second))
+		if err != nats.ErrInvalidJSAck {
 			t.Errorf("Unexpected error: %v", err)
 		}
 
@@ -2559,9 +2903,19 @@ func withJSClusterAndStream(t *testing.T, clusterName string, size int, stream *
 			t.Fatal(err)
 		}
 
-		_, err = jsm.AddStream(stream)
+		timeout := time.Now().Add(10 * time.Second)
+		for time.Now().Before(timeout) {
+			_, err = jsm.AddStream(stream)
+			if err != nil {
+				t.Logf("WARN: Got error while trying to create stream: %v", err)
+				// Backoff for a bit until cluster and resources ready.
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			break
+		}
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("Unexpected error creating stream: %v", err)
 		}
 
 		tfn(t, stream.Name, nodes...)
@@ -2676,6 +3030,243 @@ func TestJetStream_ClusterPlacement(t *testing.T) {
 	})
 }
 
+func TestJetStreamStreamMirror(t *testing.T) {
+	withJSCluster(t, "MIRROR", 3, testJetStreamMirror_Source)
+}
+
+func testJetStreamMirror_Source(t *testing.T, nodes ...*jsServer) {
+	srvA := nodes[0]
+	nc, err := nats.Connect(srvA.ClientURL())
+	if err != nil {
+		t.Error(err)
+	}
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name: "origin",
+		Placement: &nats.Placement{
+			Tags: []string{"NODE_0"},
+		},
+		Storage:  nats.MemoryStorage,
+		Replicas: 1,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error creating stream: %v", err)
+	}
+
+	totalMsgs := 10
+	for i := 0; i < totalMsgs; i++ {
+		payload := fmt.Sprintf("i:%d", i)
+		js.Publish("origin", []byte(payload))
+	}
+
+	t.Run("create mirrors", func(t *testing.T) {
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     "m1",
+			Mirror:   &nats.StreamSource{Name: "origin"},
+			Storage:  nats.FileStorage,
+			Replicas: 1,
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error creating stream: %v", err)
+		}
+
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     "m2",
+			Mirror:   &nats.StreamSource{Name: "origin"},
+			Storage:  nats.MemoryStorage,
+			Replicas: 1,
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error creating stream: %v", err)
+		}
+		msgs := make([]*nats.RawStreamMsg, 0)
+
+		// Stored message sequences start at 1
+		startSequence := 1
+
+	GetNextMsg:
+		for i := startSequence; i < totalMsgs+1; i++ {
+			var (
+				err       error
+				seq       = uint64(i)
+				msgA      *nats.RawStreamMsg
+				msgB      *nats.RawStreamMsg
+				sourceMsg *nats.RawStreamMsg
+				timeout   = time.Now().Add(2 * time.Second)
+			)
+
+			for time.Now().Before(timeout) {
+				sourceMsg, err = js.GetMsg("origin", seq)
+				if err != nil {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				msgA, err = js.GetMsg("m1", seq)
+				if err != nil {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				if !reflect.DeepEqual(sourceMsg, msgA) {
+					t.Errorf("Expected %+v, got: %+v", sourceMsg, msgA)
+				}
+
+				msgB, err = js.GetMsg("m2", seq)
+				if err != nil {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				if !reflect.DeepEqual(sourceMsg, msgB) {
+					t.Errorf("Expected %+v, got: %+v", sourceMsg, msgB)
+				}
+
+				msgs = append(msgs, msgA)
+				continue GetNextMsg
+			}
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+		}
+
+		got := len(msgs)
+		if got < totalMsgs {
+			t.Errorf("Expected %v, got: %v", totalMsgs, got)
+		}
+	})
+
+	t.Run("get mirror info", func(t *testing.T) {
+		m1, err := js.StreamInfo("m1")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		got := m1.Mirror.Name
+		expected := "origin"
+		if got != expected {
+			t.Errorf("Expected %v, got: %v", expected, got)
+		}
+
+		m2, err := js.StreamInfo("m2")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		got = m2.Mirror.Name
+		expected = "origin"
+		if got != expected {
+			t.Errorf("Expected %v, got: %v", expected, got)
+		}
+	})
+
+	t.Run("create stream from sources", func(t *testing.T) {
+		sources := make([]*nats.StreamSource, 0)
+		sources = append(sources, &nats.StreamSource{Name: "m1"})
+		sources = append(sources, &nats.StreamSource{Name: "m2"})
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:     "s1",
+			Sources:  sources,
+			Storage:  nats.FileStorage,
+			Replicas: 1,
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error creating stream: %v", err)
+		}
+
+		msgs := make([]*nats.RawStreamMsg, 0)
+
+		// Stored message sequences start at 1
+		startSequence := 1
+		expectedTotal := totalMsgs * 2
+
+	GetNextMsg:
+		for i := startSequence; i < expectedTotal+1; i++ {
+			var (
+				err     error
+				seq     = uint64(i)
+				msg     *nats.RawStreamMsg
+				timeout = time.Now().Add(5 * time.Second)
+			)
+
+		Retry:
+			for time.Now().Before(timeout) {
+				msg, err = js.GetMsg("s1", seq)
+				if err != nil {
+					time.Sleep(100 * time.Millisecond)
+					continue Retry
+				}
+				msgs = append(msgs, msg)
+				continue GetNextMsg
+			}
+			if err != nil {
+				t.Fatalf("Unexpected error fetching seq=%v: %v", seq, err)
+			}
+		}
+
+		got := len(msgs)
+		if got < expectedTotal {
+			t.Errorf("Expected %v, got: %v", expectedTotal, got)
+		}
+
+		si, err := js.StreamInfo("s1")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		got = int(si.State.Msgs)
+		if got != expectedTotal {
+			t.Errorf("Expected %v, got: %v", expectedTotal, got)
+		}
+
+		got = len(si.Sources)
+		expected := 2
+		if got != expected {
+			t.Errorf("Expected %v, got: %v", expected, got)
+		}
+	})
+
+	t.Run("update stream with sources", func(t *testing.T) {
+		si, err := js.StreamInfo("s1")
+		if err != nil {
+			t.Fatalf("Unexpected error creating stream: %v", err)
+		}
+		got := len(si.Config.Sources)
+		expected := 2
+		if got != expected {
+			t.Errorf("Expected %v, got: %v", expected, got)
+		}
+
+		got = len(si.Sources)
+		if got != expected {
+			t.Errorf("Expected %v, got: %v", expected, got)
+		}
+
+		// Make an update
+		config := si.Config
+		config.MaxMsgs = 128
+		updated, err := js.UpdateStream(&config)
+		if err != nil {
+			t.Fatalf("Unexpected error creating stream: %v", err)
+		}
+
+		got = len(updated.Config.Sources)
+		if got != expected {
+			t.Errorf("Expected %v, got: %v", expected, got)
+		}
+
+		got = len(updated.Sources)
+		if got != expected {
+			t.Errorf("Expected %v, got: %v", expected, got)
+		}
+
+		got = int(updated.Config.MaxMsgs)
+		expected = int(config.MaxMsgs)
+		if got != expected {
+			t.Errorf("Expected %v, got: %v", expected, got)
+		}
+	})
+}
+
 func TestJetStream_ClusterReconnect(t *testing.T) {
 	n := 3
 	replicas := []int{1, 3}
@@ -2704,18 +3295,6 @@ func TestJetStream_ClusterReconnect(t *testing.T) {
 		}
 	})
 
-	t.Run("qsub durable", func(t *testing.T) {
-		for _, r := range replicas {
-			t.Run(fmt.Sprintf("n=%d r=%d", n, r), func(t *testing.T) {
-				stream := &nats.StreamConfig{
-					Name:     fmt.Sprintf("bar-r%d", r),
-					Replicas: r,
-				}
-				withJSClusterAndStream(t, fmt.Sprintf("QSUBR%d", r), n, stream, testJetStream_ClusterReconnectDurableQueueSubscriber)
-			})
-		}
-	})
-
 	t.Run("sub durable", func(t *testing.T) {
 		for _, r := range replicas {
 			t.Run(fmt.Sprintf("n=%d r=%d", n, r), func(t *testing.T) {
@@ -2726,6 +3305,17 @@ func TestJetStream_ClusterReconnect(t *testing.T) {
 				withJSClusterAndStream(t, fmt.Sprintf("SUBR%d", r), n, stream, testJetStream_ClusterReconnectDurablePushSubscriber)
 			})
 		}
+	})
+
+	t.Run("qsub durable", func(t *testing.T) {
+		r := 3
+		t.Run(fmt.Sprintf("n=%d r=%d", n, r), func(t *testing.T) {
+			stream := &nats.StreamConfig{
+				Name:     fmt.Sprintf("bar-r%d", r),
+				Replicas: r,
+			}
+			withJSClusterAndStream(t, fmt.Sprintf("QSUBR%d", r), n, stream, testJetStream_ClusterReconnectDurableQueueSubscriber)
+		})
 	})
 }
 
@@ -2784,7 +3374,7 @@ func testJetStream_ClusterReconnectPullSubscriber(t *testing.T, subject string, 
 	defer done()
 
 NextMsg:
-	for recvd != totalMsgs {
+	for recvd < totalMsgs {
 		select {
 		case <-ctx.Done():
 			t.Fatalf("Timeout waiting for messages, expected: %d, got: %d", totalMsgs, recvd)
@@ -2823,25 +3413,30 @@ NextMsg:
 			t.Logf("WARN: Expected %v, got: %v", expected, got)
 		}
 
-		err = msg.AckSync()
-		if err != nil {
-			// During the reconnection, both of these errors can occur.
-			if err == nats.ErrNoResponders || err == nats.ErrTimeout {
-				// Wait for reconnection event to occur to continue.
-				select {
-				case <-reconnected:
-					continue NextMsg
-				case <-time.After(1 * time.Second):
-					continue NextMsg
-				case <-ctx.Done():
-					t.Fatal("Timed out waiting for reconnect")
+		// Add a few retries since there can be errors during the reconnect.
+		timeout := time.Now().Add(5 * time.Second)
+	RetryAck:
+		for time.Now().Before(timeout) {
+			err = msg.AckSync()
+			if err != nil {
+				// During the reconnection, both of these errors can occur.
+				if err == nats.ErrNoResponders || err == nats.ErrTimeout {
+					// Wait for reconnection event to occur to continue.
+					select {
+					case <-reconnected:
+						continue RetryAck
+					case <-time.After(100 * time.Millisecond):
+						continue RetryAck
+					case <-ctx.Done():
+						t.Fatal("Timed out waiting for reconnect")
+					}
 				}
+
+				t.Errorf("Unexpected error: %v", err)
+				continue RetryAck
 			}
-
-			t.Errorf("Unexpected error: %v", err)
-			continue NextMsg
+			break RetryAck
 		}
-
 		recvd++
 
 		// Shutdown the server after a couple of messages.
@@ -2875,8 +3470,7 @@ func testJetStream_ClusterReconnectDurableQueueSubscriber(t *testing.T, subject 
 		t.Error(err)
 	}
 
-	// Drain to allow AckSync response to be received.
-	defer nc.Drain()
+	defer nc.Close()
 
 	js, err := nc.JetStream()
 	if err != nil {
@@ -2888,7 +3482,7 @@ func testJetStream_ClusterReconnectDurableQueueSubscriber(t *testing.T, subject 
 		js.Publish(subject, []byte(payload))
 	}
 
-	ctx, done := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, done := context.WithTimeout(context.Background(), 10*time.Second)
 	defer done()
 
 	msgs := make(chan *nats.Msg, totalMsgs)
@@ -2939,7 +3533,6 @@ func testJetStream_ClusterReconnectDurableQueueSubscriber(t *testing.T, subject 
 						return
 					}
 				}
-				t.Errorf("Unexpected error: %v", err)
 			}
 		}, nats.Durable(dname), nats.ManualAck())
 
@@ -2948,11 +3541,28 @@ func testJetStream_ClusterReconnectDurableQueueSubscriber(t *testing.T, subject 
 		}
 	}
 
+	// Check for persisted messages, this could fail a few times.
+	var stream *nats.StreamInfo
+	timeout := time.Now().Add(5 * time.Second)
+	for time.Now().Before(timeout) {
+		stream, err = js.StreamInfo(subject)
+		if err == nats.ErrTimeout {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		} else if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		break
+	}
+	if stream == nil {
+		t.Logf("WARN: Failed to get stream info: %v", err)
+	}
+
 	var failedPubs int
 	for i := 10; i < totalMsgs; i++ {
 		var published bool
 		payload := fmt.Sprintf("i:%d", i)
-		timeout := time.Now().Add(10 * time.Second)
+		timeout = time.Now().Add(5 * time.Second)
 
 	Retry:
 		for time.Now().Before(timeout) {
@@ -2976,11 +3586,14 @@ func testJetStream_ClusterReconnectDurableQueueSubscriber(t *testing.T, subject 
 
 	<-ctx.Done()
 
+	// Drain to allow AckSync response to be received.
+	nc.Drain()
+
 	got := len(msgs)
 	if got != totalMsgs {
 		t.Logf("WARN: Expected %v, got: %v", totalMsgs, got)
 	}
-	if got != totalMsgs-failedPubs {
+	if got < totalMsgs-failedPubs {
 		t.Errorf("Expected %v, got: %v", totalMsgs-failedPubs, got)
 	}
 }
