@@ -1039,129 +1039,168 @@ func TestJetStreamManagement(t *testing.T) {
 	}
 
 	// Create the stream using our client API.
-	if _, err := js.AddStream(nil); err == nil {
-		t.Fatalf("Unexpected success")
-	}
-	si, err := js.AddStream(&nats.StreamConfig{Name: "foo"})
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if si == nil || si.Config.Name != "foo" {
-		t.Fatalf("StreamInfo is not correct %+v", si)
-	}
+	var si *nats.StreamInfo
+	t.Run("create stream", func(t *testing.T) {
+		if _, err := js.AddStream(nil); err == nil {
+			t.Fatalf("Unexpected success")
+		}
+		si, err := js.AddStream(&nats.StreamConfig{Name: "foo"})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if si == nil || si.Config.Name != "foo" {
+			t.Fatalf("StreamInfo is not correct %+v", si)
+		}
+	})
 
 	for i := 0; i < 25; i++ {
 		js.Publish("foo", []byte("hi"))
 	}
 
-	// Check info calls.
-	si, err = js.StreamInfo("foo")
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if si == nil || si.Config.Name != "foo" {
-		t.Fatalf("StreamInfo is not correct %+v", si)
-	}
+	t.Run("stream info", func(t *testing.T) {
+		si, err = js.StreamInfo("foo")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if si == nil || si.Config.Name != "foo" {
+			t.Fatalf("StreamInfo is not correct %+v", si)
+		}
+	})
 
-	// Update the stream using our client API.
-	if _, err := js.UpdateStream(nil); err == nil {
-		t.Fatal("Unexpected success")
-	}
-	prevMaxMsgs := si.Config.MaxMsgs
-	si, err = js.UpdateStream(&nats.StreamConfig{Name: "foo", MaxMsgs: prevMaxMsgs + 100})
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if si == nil || si.Config.Name != "foo" || si.Config.MaxMsgs == prevMaxMsgs {
-		t.Fatalf("StreamInfo is not correct %+v", si)
-	}
+	t.Run("stream update", func(t *testing.T) {
+		if _, err := js.UpdateStream(nil); err == nil {
+			t.Fatal("Unexpected success")
+		}
+		prevMaxMsgs := si.Config.MaxMsgs
+		si, err = js.UpdateStream(&nats.StreamConfig{Name: "foo", MaxMsgs: prevMaxMsgs + 100})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if si == nil || si.Config.Name != "foo" || si.Config.MaxMsgs == prevMaxMsgs {
+			t.Fatalf("StreamInfo is not correct %+v", si)
+		}
+	})
 
-	// Create a consumer using our client API.
-	ci, err := js.AddConsumer("foo", &nats.ConsumerConfig{Durable: "dlc", AckPolicy: nats.AckExplicitPolicy})
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if ci == nil || ci.Name != "dlc" || ci.Stream != "foo" {
-		t.Fatalf("ConsumerInfo is not correct %+v", ci)
-	}
+	t.Run("create consumer", func(t *testing.T) {
+		ci, err := js.AddConsumer("foo", &nats.ConsumerConfig{Durable: "dlc", AckPolicy: nats.AckExplicitPolicy})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if ci == nil || ci.Name != "dlc" || ci.Stream != "foo" {
+			t.Fatalf("ConsumerInfo is not correct %+v", ci)
+		}
 
-	if _, err = js.AddConsumer("foo", &nats.ConsumerConfig{Durable: "test.durable"}); err != nats.ErrInvalidDurableName {
-		t.Fatalf("Expected invalid durable name error")
-	}
+		if _, err = js.AddConsumer("foo", &nats.ConsumerConfig{Durable: "test.durable"}); err != nats.ErrInvalidDurableName {
+			t.Fatalf("Expected invalid durable name error")
+		}
+	})
 
-	// Check info calls.
-	ci, err = js.ConsumerInfo("foo", "dlc")
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if ci == nil || ci.Config.Durable != "dlc" {
-		t.Fatalf("ConsumerInfo is not correct %+v", si)
-	}
+	t.Run("consumer info", func(t *testing.T) {
+		ci, err := js.ConsumerInfo("foo", "dlc")
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if ci == nil || ci.Config.Durable != "dlc" {
+			t.Fatalf("ConsumerInfo is not correct %+v", si)
+		}
+	})
 
-	sl := js.NewStreamLister()
-	if !sl.Next() {
+	t.Run("list streams", func(t *testing.T) {
+		sl := js.NewStreamLister()
+		if !sl.Next() {
+			if err := sl.Err(); err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+			t.Fatalf("Unexpected stream lister next")
+		}
+		if p := sl.Page(); len(p) != 1 || p[0].Config.Name != "foo" {
+			t.Fatalf("StreamInfo is not correct %+v", p)
+		}
 		if err := sl.Err(); err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
-		t.Fatalf("Unexpected stream lister next")
-	}
-	if p := sl.Page(); len(p) != 1 || p[0].Config.Name != "foo" {
-		t.Fatalf("StreamInfo is not correct %+v", p)
-	}
-	if err := sl.Err(); err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
+	})
 
-	if cl := js.NewConsumerLister(""); cl.Next() {
-		t.Fatalf("Unexpected next ok")
-	} else if err := cl.Err(); err == nil {
-		if cl.Next() {
+	t.Run("list consumers", func(t *testing.T) {
+		if cl := js.NewConsumerLister(""); cl.Next() {
 			t.Fatalf("Unexpected next ok")
+		} else if err := cl.Err(); err == nil {
+			if cl.Next() {
+				t.Fatalf("Unexpected next ok")
+			}
+			t.Fatalf("Unexpected nil error")
 		}
-		t.Fatalf("Unexpected nil error")
-	}
-	cl := js.NewConsumerLister("foo")
-	if !cl.Next() {
+
+		cl := js.NewConsumerLister("foo")
+		if !cl.Next() {
+			if err := cl.Err(); err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+			t.Fatalf("Unexpected consumer lister next")
+		}
+		if p := cl.Page(); len(p) != 1 || p[0].Stream != "foo" || p[0].Config.Durable != "dlc" {
+			t.Fatalf("ConsumerInfo is not correct %+v", p)
+		}
 		if err := cl.Err(); err != nil {
 			t.Errorf("Unexpected error: %v", err)
 		}
-		t.Fatalf("Unexpected consumer lister next")
-	}
-	if p := cl.Page(); len(p) != 1 || p[0].Stream != "foo" || p[0].Config.Durable != "dlc" {
-		t.Fatalf("ConsumerInfo is not correct %+v", p)
-	}
-	if err := cl.Err(); err != nil {
-		t.Errorf("Unexpected error: %v", err)
-	}
+	})
 
-	// Delete a consumer using our client API.
-	if err := js.DeleteConsumer("", ""); err == nil {
-		t.Fatalf("Unexpected success")
-	}
-	if err := js.DeleteConsumer("foo", "dlc"); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
+	t.Run("list consumer names", func(t *testing.T) {
+		var names []string
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		for name := range js.ConsumerNames(ctx, "foo") {
+			names = append(names, name)
+		}
+		if got, want := len(names), 1; got != want {
+			t.Fatalf("Unexpected names, got=%d, want=%d", got, want)
+		}
+	})
 
-	// Purge a stream using our client API.
-	if err := js.PurgeStream("foo"); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if si, err := js.StreamInfo("foo"); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	} else if si.State.Msgs != 0 {
-		t.Fatalf("StreamInfo.Msgs is not correct")
-	}
+	t.Run("delete consumers", func(t *testing.T) {
+		if err := js.DeleteConsumer("", ""); err == nil {
+			t.Fatalf("Unexpected success")
+		}
+		if err := js.DeleteConsumer("foo", "dlc"); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	})
 
-	// Delete a stream using our client API.
-	if err := js.DeleteStream(""); err == nil {
-		t.Fatal("Unexpected success")
-	}
-	if err := js.DeleteStream("foo"); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if _, err := js.StreamInfo("foo"); err == nil {
-		t.Fatalf("Unexpected success")
-	}
+	t.Run("purge stream", func(t *testing.T) {
+		if err := js.PurgeStream("foo"); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if si, err := js.StreamInfo("foo"); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		} else if si.State.Msgs != 0 {
+			t.Fatalf("StreamInfo.Msgs is not correct")
+		}
+	})
+
+	t.Run("list stream names", func(t *testing.T) {
+		var names []string
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		for name := range js.StreamNames(ctx) {
+			names = append(names, name)
+		}
+		if got, want := len(names), 1; got != want {
+			t.Fatalf("Unexpected names, got=%d, want=%d", got, want)
+		}
+	})
+
+	t.Run("delete stream", func(t *testing.T) {
+		if err := js.DeleteStream(""); err == nil {
+			t.Fatal("Unexpected success")
+		}
+		if err := js.DeleteStream("foo"); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if _, err := js.StreamInfo("foo"); err == nil {
+			t.Fatalf("Unexpected success")
+		}
+	})
 
 	t.Run("fetch account info", func(t *testing.T) {
 		info, err := js.AccountInfo()
@@ -1180,8 +1219,8 @@ func TestJetStreamManagement(t *testing.T) {
 		if info.Limits.MaxConsumers != -1 {
 			t.Errorf("Expected to not have consumer limits, got: %v", info.Limits.MaxConsumers)
 		}
-		if info.API.Total != 13 {
-			t.Errorf("Expected 13 API calls, got: %v", info.API.Total)
+		if info.API.Total != 15 {
+			t.Errorf("Expected 15 API calls, got: %v", info.API.Total)
 		}
 		if info.API.Errors != 1 {
 			t.Errorf("Expected 11 API error, got: %v", info.API.Errors)
@@ -1335,7 +1374,7 @@ func testJetStreamManagement_GetMsg(t *testing.T, srvs ...*jsServer) {
 			t.Errorf("Expected %v, got: %v", 4, streamMsg.Sequence)
 		}
 		expectedMap := map[string][]string{
-			"X-Nats-Test-Data": []string{"A:1"},
+			"X-Nats-Test-Data": {"A:1"},
 		}
 		if !reflect.DeepEqual(streamMsg.Header, http.Header(expectedMap)) {
 			t.Errorf("Expected %v, got: %v", expectedMap, streamMsg.Header)
@@ -1693,6 +1732,135 @@ func TestJetStreamImportDirectOnly(t *testing.T) {
 			t.Errorf("Unexpected error: %v", err)
 		}
 	}
+}
+
+func TestJetStreamCrossAccountMirrorsAndSources(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		no_auth_user: rip
+		jetstream: {max_mem_store: 64GB, max_file_store: 10TB}
+		accounts {
+			JS {
+				jetstream: enabled
+				users = [ { user: "rip", pass: "pass" } ]
+				exports [
+					{ service: "$JS.API.CONSUMER.>" } # To create internal consumers to mirror/source.
+					{ stream: "RI.DELIVER.SYNC.>" }   # For the mirror/source consumers sending to IA via delivery subject.
+				]
+			}
+			IA {
+				jetstream: enabled
+				users = [ { user: "dlc", pass: "pass" } ]
+				imports [
+					{ service: { account: JS, subject: "$JS.API.CONSUMER.>"}, to: "RI.JS.API.CONSUMER.>" }
+					{ stream: { account: JS, subject: "RI.DELIVER.SYNC.>"} }
+				]
+			}
+			$SYS { users = [ { user: "admin", pass: "s3cr3t!" } ] }
+		}
+	`))
+	defer os.Remove(conf)
+
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	nc1, err := nats.Connect(s.ClientURL(), nats.UserInfo("rip", "pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc1.Close()
+	js1, err := nc1.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = js1.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Replicas: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	toSend := 100
+	for i := 0; i < toSend; i++ {
+		if _, err := js1.Publish("TEST", []byte("OK")); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	nc2, err := nats.Connect(s.ClientURL(), nats.UserInfo("dlc", "pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc2.Close()
+	js2, err := nc1.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkMsgCount := func(t *testing.T, js nats.JetStreamManager, timeout time.Duration, want int) {
+		t.Helper()
+
+		deadline := time.Now().Add(timeout)
+		var loopErr error
+		for time.Now().Before(deadline) {
+			si, err := js2.StreamInfo("MY_MIRROR_TEST")
+			if err != nil {
+				loopErr = err
+				continue
+			}
+			loopErr = nil
+
+			if got := int(si.State.Msgs); got != want {
+				loopErr = fmt.Errorf("Unexpected msg count, got %d, want %d", got, want)
+				continue
+			}
+			loopErr = nil
+			break
+		}
+		if loopErr != nil {
+			t.Fatal(loopErr)
+		}
+	}
+
+	_, err = js2.AddStream(&nats.StreamConfig{
+		Name:    "MY_MIRROR_TEST",
+		Storage: nats.FileStorage,
+		Mirror: &nats.StreamSource{
+			Name: "TEST",
+			External: &nats.ExternalStream{
+				APIPrefix:     "RI.JS.API",
+				DeliverPrefix: "RI.DELIVER.SYNC.MIRRORS",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkMsgCount(t, js2, 2*time.Second, toSend)
+
+	_, err = js2.AddStream(&nats.StreamConfig{
+		Name:    "MY_SOURCE_TEST",
+		Storage: nats.FileStorage,
+		Sources: []*nats.StreamSource{
+			&nats.StreamSource{
+				Name: "TEST",
+				External: &nats.ExternalStream{
+					APIPrefix:     "RI.JS.API",
+					DeliverPrefix: "RI.DELIVER.SYNC.SOURCES",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkMsgCount(t, js2, 2*time.Second, toSend)
 }
 
 func TestJetStreamAutoMaxAckPending(t *testing.T) {
