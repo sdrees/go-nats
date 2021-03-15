@@ -115,7 +115,12 @@ type JetStreamContext interface {
 
 // js is an internal struct from a JetStreamContext.
 type js struct {
-	nc *Conn
+	nc   *Conn
+	opts *jsOpts
+}
+
+type jsOpts struct {
+	ctx context.Context
 	// For importing JetStream from other accounts.
 	pre string
 	// Amount of time to wait for API requests.
@@ -128,15 +133,21 @@ const defaultRequestWait = 5 * time.Second
 
 // JetStream returns a JetStream context for pub/sub interactions.
 func (nc *Conn) JetStream(opts ...JSOpt) (JetStreamContext, error) {
-	js := &js{nc: nc, pre: defaultAPIPrefix, wait: defaultRequestWait}
+	js := &js{
+		nc: nc,
+		opts: &jsOpts{
+			pre:  defaultAPIPrefix,
+			wait: defaultRequestWait,
+		},
+	}
 
 	for _, opt := range opts {
-		if err := opt.configureJSContext(js); err != nil {
+		if err := opt.configureJSContext(js.opts); err != nil {
 			return nil, err
 		}
 	}
 
-	if js.direct {
+	if js.opts.direct {
 		return js, nil
 	}
 
@@ -152,19 +163,19 @@ func (nc *Conn) JetStream(opts ...JSOpt) (JetStreamContext, error) {
 
 // JSOpt configures a JetStream context.
 type JSOpt interface {
-	configureJSContext(opts *js) error
+	configureJSContext(opts *jsOpts) error
 }
 
 // jsOptFn configures an option for the JetStream context.
-type jsOptFn func(opts *js) error
+type jsOptFn func(opts *jsOpts) error
 
-func (opt jsOptFn) configureJSContext(opts *js) error {
+func (opt jsOptFn) configureJSContext(opts *jsOpts) error {
 	return opt(opts)
 }
 
 // APIPrefix changes the default prefix used for the JetStream API.
 func APIPrefix(pre string) JSOpt {
-	return jsOptFn(func(js *js) error {
+	return jsOptFn(func(js *jsOpts) error {
 		js.pre = pre
 		if !strings.HasSuffix(js.pre, ".") {
 			js.pre = js.pre + "."
@@ -175,18 +186,18 @@ func APIPrefix(pre string) JSOpt {
 
 // DirectOnly makes a JetStream context avoid using the JetStream API altogether.
 func DirectOnly() JSOpt {
-	return jsOptFn(func(js *js) error {
+	return jsOptFn(func(js *jsOpts) error {
 		js.direct = true
 		return nil
 	})
 }
 
 func (js *js) apiSubj(subj string) string {
-	if js.pre == _EMPTY_ {
+	if js.opts.pre == _EMPTY_ {
 		return subj
 	}
 	var b strings.Builder
-	b.WriteString(js.pre)
+	b.WriteString(js.opts.pre)
 	b.WriteString(subj)
 	return b.String()
 }
@@ -251,7 +262,7 @@ func (js *js) PublishMsg(m *Msg, opts ...PubOpt) (*PubAck, error) {
 		return nil, ErrContextAndTimeout
 	}
 	if o.ttl == 0 && o.ctx == nil {
-		o.ttl = js.wait
+		o.ttl = js.opts.wait
 	}
 
 	if o.id != _EMPTY_ {
@@ -335,7 +346,7 @@ func ExpectLastMsgId(id string) PubOpt {
 // MaxWait sets the maximum amount of time we will wait for a response.
 type MaxWait time.Duration
 
-func (ttl MaxWait) configureJSContext(js *js) error {
+func (ttl MaxWait) configureJSContext(js *jsOpts) error {
 	js.wait = time.Duration(ttl)
 	return nil
 }
@@ -359,6 +370,11 @@ type ContextOpt struct {
 }
 
 func (ctx ContextOpt) configurePublish(opts *pubOpts) error {
+	opts.ctx = ctx
+	return nil
+}
+
+func (ctx ContextOpt) configureJSContext(opts *jsOpts) error {
 	opts.ctx = ctx
 	return nil
 }
@@ -436,7 +452,7 @@ func (jsi *jsSub) unsubscribe(drainMode bool) error {
 
 	// Skip if in direct mode as well.
 	js := jsi.js
-	if js.direct {
+	if js.opts.direct {
 		return nil
 	}
 
@@ -514,11 +530,11 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 		requiresAPI  = (stream == _EMPTY_ && consumer == _EMPTY_) && o.cfg.DeliverSubject == _EMPTY_
 	)
 
-	if js.direct && requiresAPI {
+	if js.opts.direct && requiresAPI {
 		return nil, ErrDirectModeRequired
 	}
 
-	if js.direct {
+	if js.opts.direct {
 		if o.cfg.DeliverSubject != _EMPTY_ {
 			deliver = o.cfg.DeliverSubject
 		} else {
@@ -613,7 +629,7 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 			ccSubj = fmt.Sprintf(apiConsumerCreateT, stream)
 		}
 
-		resp, err := js.nc.Request(js.apiSubj(ccSubj), j, js.wait)
+		resp, err := js.nc.Request(js.apiSubj(ccSubj), j, js.opts.wait)
 		if err != nil {
 			if err == ErrNoResponders {
 				err = ErrJetStreamNotEnabled
@@ -641,7 +657,7 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, opts []
 	} else {
 		sub.jsi.stream = stream
 		sub.jsi.consumer = consumer
-		if js.direct {
+		if js.opts.direct {
 			sub.jsi.deliver = o.cfg.DeliverSubject
 		} else {
 			sub.jsi.deliver = ccfg.DeliverSubject
@@ -675,7 +691,7 @@ func (js *js) lookupStreamBySubject(subj string) (string, error) {
 	if err != nil {
 		return _EMPTY_, err
 	}
-	resp, err := js.nc.Request(js.apiSubj(apiStreams), j, js.wait)
+	resp, err := js.nc.Request(js.apiSubj(apiStreams), j, js.opts.wait)
 	if err != nil {
 		if err == ErrNoResponders {
 			err = ErrJetStreamNotEnabled
@@ -828,6 +844,22 @@ func MaxAckPending(n int) SubOpt {
 	})
 }
 
+// ReplayOriginal replays the messages at the original speed.
+func ReplayOriginal() SubOpt {
+	return subOptFn(func(opts *subOpts) error {
+		opts.cfg.ReplayPolicy = ReplayOriginalPolicy
+		return nil
+	})
+}
+
+// RateLimit is the Bits per sec rate limit applied to a push consumer.
+func RateLimit(n uint64) SubOpt {
+	return subOptFn(func(opts *subOpts) error {
+		opts.cfg.RateLimit = n
+		return nil
+	})
+}
+
 func (sub *Subscription) ConsumerInfo() (*ConsumerInfo, error) {
 	sub.mu.Lock()
 	// TODO(dlc) - Better way to mark especially if we attach.
@@ -838,7 +870,7 @@ func (sub *Subscription) ConsumerInfo() (*ConsumerInfo, error) {
 
 	// Consumer info lookup should fail if in direct mode.
 	js := sub.jsi.js
-	if js.direct {
+	if js.opts.direct {
 		sub.mu.Unlock()
 		return nil, ErrDirectModeRequired
 	}
@@ -867,8 +899,14 @@ func (sub *Subscription) Poll() error {
 }
 
 func (js *js) getConsumerInfo(stream, consumer string) (*ConsumerInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), js.opts.wait)
+	defer cancel()
+	return js.getConsumerInfoContext(ctx, stream, consumer)
+}
+
+func (js *js) getConsumerInfoContext(ctx context.Context, stream, consumer string) (*ConsumerInfo, error) {
 	ccInfoSubj := fmt.Sprintf(apiConsumerInfoT, stream, consumer)
-	resp, err := js.nc.Request(js.apiSubj(ccInfoSubj), nil, js.wait)
+	resp, err := js.nc.RequestWithContext(ctx, js.apiSubj(ccInfoSubj), nil)
 	if err != nil {
 		if err == ErrNoResponders {
 			err = ErrJetStreamNotEnabled
@@ -937,7 +975,7 @@ func (m *Msg) ackReply(ackType []byte, sync bool, opts ...PubOpt) error {
 	if o.ttl > 0 {
 		wait = o.ttl
 	} else if js != nil {
-		wait = js.wait
+		wait = js.opts.wait
 	}
 
 	if isPullMode {
@@ -1128,19 +1166,23 @@ func (p AckPolicy) String() string {
 	}
 }
 
+// ReplayPolicy determines how the consumer should replay messages it already has queued in the stream.
 type ReplayPolicy int
 
 const (
-	ReplayInstant ReplayPolicy = iota
-	ReplayOriginal
+	// ReplayInstant will replay messages as fast as possible.
+	ReplayInstantPolicy ReplayPolicy = iota
+
+	// ReplayOriginalPolicy will maintain the same timing as the messages were received.
+	ReplayOriginalPolicy
 )
 
 func (p *ReplayPolicy) UnmarshalJSON(data []byte) error {
 	switch string(data) {
 	case jsonString("instant"):
-		*p = ReplayInstant
+		*p = ReplayInstantPolicy
 	case jsonString("original"):
-		*p = ReplayOriginal
+		*p = ReplayOriginalPolicy
 	default:
 		return fmt.Errorf("can not unmarshal %q", data)
 	}
@@ -1150,9 +1192,9 @@ func (p *ReplayPolicy) UnmarshalJSON(data []byte) error {
 
 func (p ReplayPolicy) MarshalJSON() ([]byte, error) {
 	switch p {
-	case ReplayOriginal:
+	case ReplayOriginalPolicy:
 		return json.Marshal("original")
-	case ReplayInstant:
+	case ReplayInstantPolicy:
 		return json.Marshal("instant")
 	default:
 		return nil, fmt.Errorf("unknown replay policy %v", p)
