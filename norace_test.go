@@ -135,7 +135,7 @@ func TestNoRaceJetStreamConsumerSlowConsumer(t *testing.T) {
 	nc.SetErrorHandler(func(_ *Conn, _ *Subscription, _ error) {})
 
 	// Queue up 1M small messages.
-	toSend := uint64(1_000_000)
+	toSend := uint64(1000000)
 	for i := uint64(0); i < toSend; i++ {
 		nc.Publish("js.p", []byte("ok"))
 	}
@@ -158,12 +158,12 @@ func TestNoRaceJetStreamConsumerSlowConsumer(t *testing.T) {
 		if received >= toSend {
 			done <- true
 		}
-		meta, err := m.MetaData()
+		meta, err := m.Metadata()
 		if err != nil {
 			t.Fatalf("could not get message metadata: %s", err)
 		}
-		if meta.Stream != received {
-			t.Errorf("Missed a sequence, was expecting %d but got %d, last error: '%v'", received, meta.Stream, nc.LastError())
+		if meta.Sequence.Stream != received {
+			t.Errorf("Missed a sequence, was expecting %d but got %d, last error: '%v'", received, meta.Sequence.Stream, nc.LastError())
 			nc.Close()
 		}
 		m.Ack()
