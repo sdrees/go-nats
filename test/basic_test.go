@@ -20,6 +20,7 @@ import (
 	"math"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -180,7 +181,7 @@ func TestBadOptionTimeoutConnect(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expected an error")
 	}
-	if err != nats.ErrNoServers {
+	if !strings.Contains(err.Error(), "invalid") {
 		t.Fatalf("Expected a ErrNoServers error: Got %v\n", err)
 	}
 }
@@ -622,6 +623,20 @@ func TestBasicNoRespondersSupport(t *testing.T) {
 	if m, err := nc.RequestWithContext(ctx, "foo", nil); err != nats.ErrNoResponders {
 		t.Fatalf("Expected a no responders error and nil msg, got m:%+v and err: %v", m, err)
 	}
+
+	// SubscribeSync
+	inbox := nats.NewInbox()
+	sub, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = nc.PublishRequest("foo", inbox, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, err := sub.NextMsg(2 * time.Second); err != nats.ErrNoResponders {
+		t.Fatalf("Expected a no responders error and nil msg, got m:%+v and err: %v", m, err)
+	}
 }
 
 func TestOldRequest(t *testing.T) {
@@ -721,7 +736,7 @@ func TestSimultaneousRequests(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			if _, err := nc.Request("foo", nil, 2*time.Second); err != nil {
-				errCh <- fmt.Errorf("expected to receive a timeout error")
+				errCh <- fmt.Errorf("Error on request: %v", err)
 			}
 		}()
 	}
